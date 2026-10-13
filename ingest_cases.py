@@ -134,9 +134,14 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
             import pickle
             with open("clus.pkl", "rb") as f:
                 cached = pickle.load(f)
-            if cached and isinstance(cached, dict):
-                for k, v in cached.items():
+            # New format: {"_dump_date": ..., "clusters": {id: (court, name, date, ...)}}
+            # Legacy format: plain {id: tuple} - ignored (cannot validate dump date)
+            if isinstance(cached, dict) and cached.get("_dump_date") == date_str:
+                rows = cached.get("clusters", {})
+                for k, v in rows.items():
                     if isinstance(v, (list, tuple)) and len(v) >= 3:
+                        if court_filter and str(v[0]).lower() != court_filter:
+                            continue
                         clusters[str(k)] = {
                             "court": v[0],
                             "case_name": v[1],
@@ -144,7 +149,10 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
                             "citations": "[]",
                             "citation_count": 0
                         }
-                print(f"[clusters] Loaded {len(clusters):,} federal clusters from clus.pkl (skipped scan!)")
+                label = f" [court filter: {court_filter}]" if court_filter else ""
+                print(f"[clusters] Loaded {len(clusters):,} clusters from clus.pkl, dump {date_str}{label} (skipped scan!)")
+            else:
+                print("[clusters] clus.pkl ignored (stale/legacy format or different dump date) - rescanning")
         except Exception as e:
             print(f"[clusters] Note on clus.pkl cache: {e}")
 
@@ -201,6 +209,15 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
                 print(f"  [clusters] scanned {i:,} | federal clusters: {len(clusters):,} ({time.time()-t_clus:.0f}s)", flush=True)
         p.kill()
         print(f"[clusters] Found {len(clusters):,} federal case clusters in {time.time()-t_clus:.1f}s")
+
+        # Cache clusters so re-runs (e.g. --court filters, resume) skip the dockets+clusters scans
+        try:
+            import pickle
+            with open("clus.pkl", "wb") as f:
+                pickle.dump({"_dump_date": date_str, "clusters": clusters}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print(f"[clusters] Cached {len(clusters):,} clusters to clus.pkl (dump {date_str})")
+        except Exception as e:
+            print(f"[clusters] Could not cache clusters: {e}")
 
     # 4. Stream Opinions and insert into SQLite
     t_ops = time.time()
