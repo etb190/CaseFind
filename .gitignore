@@ -6,3 +6,20 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Large data files
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.pickle
+*.jsonl
+*.bz2
+
+# Editor / Studio directories
+.cursor-server/
+.vscode-server/
+.windsurf-server/
+.idea/
+.lightning_studio/
+*.swp
