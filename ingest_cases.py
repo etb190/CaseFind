@@ -69,8 +69,16 @@ def init_db(db_path, clear=False):
 def stream_csv(name, date_str):
     url = f"{BULK_BASE}{name}-{date_str}.csv.bz2"
     print(f"[download] Streaming {url} ...", flush=True)
+    fetcher = os.environ.get("FETCHER", "curl")
+    if fetcher == "parallel":
+        pfetch = os.environ.get("PFETCH_PATH", "pfetch.py")
+        conns = os.environ.get("PARALLEL_CONNS", "16")
+        chunk_mb = os.environ.get("PARALLEL_CHUNK_MB", "8")
+        cmd = f'python3 "{pfetch}" "{url}" {chunk_mb} {conns} | lbzip2 -dc'
+    else:
+        cmd = f"curl -sL {url} | lbzip2 -dc"
     p = subprocess.Popen(
-        f"curl -sL {url} | lbzip2 -dc",
+        cmd,
         shell=True,
         stdout=subprocess.PIPE,
         text=True,
@@ -110,7 +118,7 @@ def is_bankruptcy_court(court_id, jurisdiction=""):
     cid = (court_id or "").lower()
     return jurisdiction == "FB" or "bankr" in cid or "bap" in cid or (len(cid) >= 3 and cid.endswith("b") and cid not in ("scotus", "cabc"))
 
-def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_districts=True, include_bankruptcy=False):
+def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_districts=True, include_bankruptcy=False, court_filter=None):
     ensure_lbzip2()
     init_db(DB_PATH, clear=clear)
 
@@ -148,6 +156,8 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
         for r in rd:
             juris = r.get("jurisdiction", "")
             cid = r.get("id", "")
+            if court_filter and cid != court_filter:
+                continue
             if cid in FEDERAL_APPELLATE or juris in ("F", "FD", "FB", "FS"):
                 # Exclude bankruptcy courts entirely unless explicitly requested
                 if not include_bankruptcy and is_bankruptcy_court(cid, juris):
@@ -165,6 +175,8 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
         federal_dockets = {}
         for i, r in enumerate(rd):
             court_id = r.get("court_id", "")
+            if court_filter and court_id != court_filter:
+                continue
             if court_id in federal_courts:
                 federal_dockets[r["id"]] = court_id
             if i > 0 and i % 2_000_000 == 0:
@@ -283,6 +295,7 @@ if __name__ == "__main__":
     parser.add_argument("--keep-existing", action="store_true", help="Append without clearing previous DB")
     parser.add_argument("--appeals-only", action="store_true", help="Ingest only Supreme Court and Circuit Appeals")
     parser.add_argument("--include-bankruptcy", action="store_true", help="Also ingest bankruptcy courts (excluded by default)")
+    parser.add_argument("--court", type=str, default=None, help="Restrict ingestion to one court id (e.g. scotus, ca9, nyed)")
     args = parser.parse_args()
 
     run_ingest(
@@ -290,5 +303,6 @@ if __name__ == "__main__":
         target_count=args.limit,
         clear=not args.keep_existing,
         include_districts=not args.appeals_only,
-        include_bankruptcy=args.include_bankruptcy
+        include_bankruptcy=args.include_bankruptcy,
+        court_filter=(args.court.lower() if args.court else None)
     )

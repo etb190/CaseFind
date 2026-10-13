@@ -1,26 +1,9 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
-!.env.example
-
-# Large data files
+cases.db
+cases*.db
 *.db
-*.sqlite
-*.sqlite3
-*.pkl
-*.pickle
-*.jsonl
-*.bz2
-
-# Editor / Studio directories
-.cursor-server/
-.vscode-server/
-.windsurf-server/
-.idea/
-.lightning_studio/
-*.swp
+*.log
+clus.pkl
+dockets.pkl
+clusters.pkl
 __pycache__/
+node_modules/
