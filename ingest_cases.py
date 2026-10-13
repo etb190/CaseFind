@@ -128,11 +128,18 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
 
     clusters = {}
 
-    # Check if local clus.pkl cache exists to skip dockets & clusters scans
-    if os.path.exists("clus.pkl"):
+    # Check cached cluster scan to skip dockets & clusters scans.
+    # Court-specific runs prefer their own cache file and may fall back to the
+    # unfiltered clus.pkl (filtered in memory). Filtered scans never write to
+    # clus.pkl, so a partial cache can never masquerade as the full federal set.
+    cache_file = "clus.pkl" if not court_filter else f"clus.{court_filter}.pkl"
+    cache_candidates = [cache_file] if not court_filter else [cache_file, "clus.pkl"]
+    for cache_path in cache_candidates:
+        if not os.path.exists(cache_path):
+            continue
         try:
             import pickle
-            with open("clus.pkl", "rb") as f:
+            with open(cache_path, "rb") as f:
                 cached = pickle.load(f)
             # New format: {"_dump_date": ..., "clusters": {id: (court, name, date, ...)}}
             # Legacy format: plain {id: tuple} - ignored (cannot validate dump date)
@@ -150,11 +157,12 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
                             "citation_count": 0
                         }
                 label = f" [court filter: {court_filter}]" if court_filter else ""
-                print(f"[clusters] Loaded {len(clusters):,} clusters from clus.pkl, dump {date_str}{label} (skipped scan!)")
+                print(f"[clusters] Loaded {len(clusters):,} clusters from {cache_path}, dump {date_str}{label} (skipped scan!)")
+                break
             else:
-                print("[clusters] clus.pkl ignored (stale/legacy format or different dump date) - rescanning")
+                print(f"[clusters] {cache_path} ignored (stale/legacy format or different dump date) - rescanning")
         except Exception as e:
-            print(f"[clusters] Note on clus.pkl cache: {e}")
+            print(f"[clusters] Note on {cache_path} cache: {e}")
 
     if not clusters:
         # 1. Courts
@@ -210,12 +218,14 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
         p.kill()
         print(f"[clusters] Found {len(clusters):,} federal case clusters in {time.time()-t_clus:.1f}s")
 
-        # Cache clusters so re-runs (e.g. --court filters, resume) skip the dockets+clusters scans
+        # Cache clusters so re-runs (e.g. --court filters, resume) skip the dockets+clusters scans.
+        # NOTE: saved under the filter-specific name - a --court run never overwrites clus.pkl.
         try:
             import pickle
-            with open("clus.pkl", "wb") as f:
+            with open(cache_file, "wb") as f:
                 pickle.dump({"_dump_date": date_str, "clusters": clusters}, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"[clusters] Cached {len(clusters):,} clusters to clus.pkl (dump {date_str})")
+            scope = "full federal" if not court_filter else f"court={court_filter}"
+            print(f"[clusters] Cached {len(clusters):,} clusters ({scope}) to {cache_file} (dump {date_str})")
         except Exception as e:
             print(f"[clusters] Could not cache clusters: {e}")
 
