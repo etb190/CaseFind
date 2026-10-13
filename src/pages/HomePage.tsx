@@ -1,14 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from '../context/RouterContext';
-import { fetchCourts } from '../services/api';
+import { fetchCourts, fetchFeatures } from '../services/api';
 import { CourtOption } from '../types';
-import { Search, SlidersHorizontal, ArrowRight, BookOpen, Clock, Building2 } from 'lucide-react';
+import { Search, SlidersHorizontal, ArrowRight, Building2, Sparkles } from 'lucide-react';
 
-const COURT_OPTIONS_DEFAULT: CourtOption[] = [
-  { value: 'F', label: 'Appeals & Supreme Court', count: 19 },
-  { value: 'FD', label: 'District Courts', count: 4 },
-  { value: 'FB', label: 'Bankruptcy Courts', count: 4 },
-  { value: 'FS', label: 'Special Jurisdiction', count: 4 },
+const FALLBACK_COURTS: CourtOption[] = [
+  { value: 'F', label: 'Appeals' },
+  { value: 'FD', label: 'District' },
+  { value: 'FB', label: 'Bankruptcy' },
+  { value: 'FS', label: 'Special' },
 ];
 
 const SUGGESTED_SEARCHES = [
@@ -26,8 +26,9 @@ export const HomePage: React.FC = () => {
   const [selectedCourts, setSelectedCourts] = useState<string[]>([]);
   const [yearFrom, setYearFrom] = useState('');
   const [yearTo, setYearTo] = useState('');
-  const [courts, setCourts] = useState<CourtOption[]>(COURT_OPTIONS_DEFAULT);
-  const [showFilters, setShowFilters] = useState(true);
+  const [courts, setCourts] = useState<CourtOption[]>(FALLBACK_COURTS);
+  const [semanticSupported, setSemanticSupported] = useState(false);
+  const [searchMode, setSearchMode] = useState<'keyword' | 'concept'>('keyword');
 
   useEffect(() => {
     let mounted = true;
@@ -37,9 +38,20 @@ export const HomePage: React.FC = () => {
           setCourts(data);
         }
       })
-      .catch((err) => {
-        console.error('Failed to load courts:', err);
+      .catch(() => {
+        // Keep fallback filter labels
       });
+
+    fetchFeatures()
+      .then((feat) => {
+        if (mounted) {
+          setSemanticSupported(Boolean(feat?.semantic));
+        }
+      })
+      .catch(() => {
+        if (mounted) setSemanticSupported(false);
+      });
+
     return () => {
       mounted = false;
     };
@@ -70,6 +82,9 @@ export const HomePage: React.FC = () => {
     }
     if (yearTo.trim()) {
       params.set('year_to', yearTo.trim());
+    }
+    if (semanticSupported && searchMode === 'concept') {
+      params.set('mode', 'concept');
     }
     params.set('page', '1');
 
@@ -118,6 +133,37 @@ export const HomePage: React.FC = () => {
               </button>
             </div>
           </div>
+
+          {/* Concept Search Switch - Shown ONLY when GET /api/features returns { semantic: true } */}
+          {semanticSupported && (
+            <div className="flex items-center justify-end mt-2.5 gap-2">
+              <div className="inline-flex items-center p-0.5 rounded-lg bg-stone-100 dark:bg-stone-800 border border-stone-200 dark:border-stone-700 text-xs font-interface">
+                <button
+                  type="button"
+                  onClick={() => setSearchMode('keyword')}
+                  className={`px-3 py-1 rounded-md transition-colors cursor-pointer ${
+                    searchMode === 'keyword'
+                      ? 'bg-white dark:bg-stone-900 text-stone-900 dark:text-stone-100 font-medium shadow-xs'
+                      : 'text-stone-500 hover:text-stone-900 dark:hover:text-stone-100'
+                  }`}
+                >
+                  Keyword
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSearchMode('concept')}
+                  className={`px-3 py-1 rounded-md transition-colors flex items-center gap-1 cursor-pointer ${
+                    searchMode === 'concept'
+                      ? 'bg-white dark:bg-stone-900 text-stone-900 dark:text-stone-100 font-medium shadow-xs'
+                      : 'text-stone-500 hover:text-stone-900 dark:hover:text-stone-100'
+                  }`}
+                >
+                  <Sparkles className="w-3 h-3 text-amber-500" />
+                  <span>Concept</span>
+                </button>
+              </div>
+            </div>
+          )}
         </form>
 
         {/* Filters Section (Court Type + Year Range) */}
@@ -163,9 +209,11 @@ export const HomePage: React.FC = () => {
                       }`}
                     >
                       <span className="truncate mr-1">{court.label}</span>
-                      <span className={`text-[11px] tabular-nums shrink-0 ${isChecked ? 'opacity-80' : 'text-stone-400'}`}>
-                        {court.count}
-                      </span>
+                      {court.count !== undefined && (
+                        <span className={`text-[11px] tabular-nums shrink-0 ${isChecked ? 'opacity-80' : 'text-stone-400'}`}>
+                          {court.count}
+                        </span>
+                      )}
                     </button>
                   );
                 })}
@@ -250,7 +298,7 @@ export const HomePage: React.FC = () => {
           </div>
         </div>
 
-        {/* Suggested Searches & Quick Links */}
+        {/* Suggested Searches */}
         <div className="w-full">
           <div className="text-xs text-stone-500 dark:text-stone-400 font-interface mb-2.5 text-center sm:text-left">
             <span>Popular searches:</span>

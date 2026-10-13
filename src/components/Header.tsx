@@ -21,7 +21,7 @@ export const Header: React.FC = () => {
           </div>
           <div className="flex flex-col">
             <span className="text-base font-semibold tracking-tight text-stone-900 dark:text-stone-100 font-interface leading-none">
-              JurisSearch
+              CaseFind
             </span>
             <span className="text-[10px] tracking-wide text-stone-500 dark:text-stone-400 font-interface uppercase mt-0.5">
               Federal Opinions

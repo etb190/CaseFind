@@ -1,5 +1,5 @@
 {
-  "name": "JurisSearch - US Federal Court Legal Research",
+  "name": "CaseFind",
   "description": "Fast, minimal legal research tool for searching US federal court opinions, appeals, district, and bankruptcy cases with full-text reading.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

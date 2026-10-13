@@ -1,5 +1,4 @@
-import { SearchResponse, CourtOption, searchCases, getCaseById, getCourts } from '../data/searchLogic';
-import { CaseRecord } from '../data/cases';
+import { SearchResponse, CaseRecord, CourtOption, FeaturesResponse } from '../types';
 
 export interface SearchQueryParams {
   q?: string;
@@ -7,9 +6,12 @@ export interface SearchQueryParams {
   year_from?: string | number;
   year_to?: string | number;
   page?: string | number;
+  mode?: 'keyword' | 'concept';
 }
 
-export async function fetchSearch(params: SearchQueryParams): Promise<SearchResponse> {
+const SERVER_ERROR_MESSAGE = "Couldn't reach the server. Try again.";
+
+function buildSearchParams(params: SearchQueryParams): string {
   const searchParams = new URLSearchParams();
   if (params.q !== undefined && params.q !== '') {
     searchParams.set('q', params.q);
@@ -26,25 +28,31 @@ export async function fetchSearch(params: SearchQueryParams): Promise<SearchResp
   if (params.page) {
     searchParams.set('page', String(params.page));
   }
+  return searchParams.toString();
+}
 
-  const url = `/api/search?${searchParams.toString()}`;
+export async function fetchSearch(
+  params: SearchQueryParams,
+  isConcept = false
+): Promise<SearchResponse> {
+  const queryString = buildSearchParams(params);
+  const endpoint = isConcept ? '/api/semantic' : '/api/search';
+  const url = `${endpoint}?${queryString}`;
 
   try {
     const res = await fetch(url);
     if (!res.ok) {
-      throw new Error(`Server returned HTTP ${res.status}`);
+      throw new Error(SERVER_ERROR_MESSAGE);
     }
     const data = await res.json();
     return data as SearchResponse;
-  } catch (err) {
-    // If running in purely static environment or dev without backend running, fallback gracefully
-    console.warn(`Direct fetch to ${url} encountered issue, using internal logic fallback:`, err);
-    return searchCases(params);
+  } catch (err: any) {
+    throw new Error(SERVER_ERROR_MESSAGE);
   }
 }
 
-export async function fetchCase(id: string): Promise<CaseRecord> {
-  const url = `/api/case/${encodeURIComponent(id)}`;
+export async function fetchCase(id: string | number): Promise<CaseRecord> {
+  const url = `/api/case/${encodeURIComponent(String(id))}`;
 
   try {
     const res = await fetch(url);
@@ -52,20 +60,15 @@ export async function fetchCase(id: string): Promise<CaseRecord> {
       throw new Error('Case not found');
     }
     if (!res.ok) {
-      throw new Error(`Server returned HTTP ${res.status}`);
+      throw new Error(SERVER_ERROR_MESSAGE);
     }
     const data = await res.json();
     return data as CaseRecord;
   } catch (err: any) {
-    if (err?.message === 'Case not found') {
+    if (err.message === 'Case not found') {
       throw err;
     }
-    console.warn(`Direct fetch to ${url} encountered issue, using fallback:`, err);
-    const item = getCaseById(id);
-    if (!item) {
-      throw new Error('Case not found');
-    }
-    return item;
+    throw new Error(SERVER_ERROR_MESSAGE);
   }
 }
 
@@ -75,12 +78,26 @@ export async function fetchCourts(): Promise<CourtOption[]> {
   try {
     const res = await fetch(url);
     if (!res.ok) {
-      throw new Error(`Server returned HTTP ${res.status}`);
+      throw new Error(SERVER_ERROR_MESSAGE);
     }
     const data = await res.json();
     return data as CourtOption[];
   } catch (err) {
-    console.warn(`Direct fetch to ${url} encountered issue, using fallback:`, err);
-    return getCourts();
+    throw new Error(SERVER_ERROR_MESSAGE);
+  }
+}
+
+export async function fetchFeatures(): Promise<FeaturesResponse> {
+  const url = '/api/features';
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      return { semantic: false };
+    }
+    const data = await res.json();
+    return { semantic: Boolean(data?.semantic) };
+  } catch {
+    return { semantic: false };
   }
 }

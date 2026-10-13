@@ -2,7 +2,7 @@ import React, { useEffect, useState, useMemo } from 'react';
 import { useRouter } from '../context/RouterContext';
 import { fetchCase } from '../services/api';
 import { CaseRecord } from '../types';
-import { ArrowLeft, Copy, Check, Printer, Share2, BookOpen, Clock, AlertCircle, Type, ZoomIn, ZoomOut } from 'lucide-react';
+import { ArrowLeft, Copy, Check, Printer, AlertCircle, RefreshCw } from 'lucide-react';
 
 export const CasePage: React.FC = () => {
   const { path, goBack, navigate } = useRouter();
@@ -13,11 +13,11 @@ export const CasePage: React.FC = () => {
   const [fontSize, setFontSize] = useState<'sm' | 'base' | 'lg' | 'xl'>('base');
   const [scrollProgress, setScrollProgress] = useState(0);
 
-  // Extract ID from `/case/<id>`
+  // Extract ID from `/case/<id>` - treated as opaque string
   const caseId = useMemo(() => {
-    const parts = path.split('/');
-    if (parts.length >= 3 && parts[1] === 'case') {
-      return decodeURIComponent(parts[2]);
+    const prefix = '/case/';
+    if (path.startsWith(prefix)) {
+      return decodeURIComponent(path.slice(prefix.length));
     }
     return '';
   }, [path]);
@@ -35,14 +35,13 @@ export const CasePage: React.FC = () => {
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  useEffect(() => {
+  const loadCase = () => {
     if (!caseId) {
-      setError('Invalid case ID');
+      setError('Case not found');
       setIsLoading(false);
       return;
     }
 
-    setIsLoading(false);
     setIsLoading(true);
     setError(null);
 
@@ -52,21 +51,24 @@ export const CasePage: React.FC = () => {
         setIsLoading(false);
       })
       .catch((err: any) => {
-        console.error('Fetch case error:', err);
-        setError(err.message || 'Case not found');
+        setError(err.message || "Couldn't reach the server. Try again.");
         setIsLoading(false);
       });
+  };
+
+  useEffect(() => {
+    loadCase();
   }, [caseId]);
 
-  // Format legal citation for clipboard (e.g., "Miranda v. Arizona, 384 U.S. 436 (1966)")
+  // Format legal citation for clipboard
   const formattedCitation = useMemo(() => {
     if (!caseData) return '';
     const year = caseData.date_filed ? caseData.date_filed.slice(0, 4) : '';
     const primaryCite = caseData.citations?.[0] || '';
     if (primaryCite) {
-      return `${caseData.case_name}, ${primaryCite} (${year})`;
+      return `${caseData.case_name}, ${primaryCite}${year ? ` (${year})` : ''}`;
     }
-    return `${caseData.case_name} (${year})`;
+    return `${caseData.case_name}${year ? ` (${year})` : ''}`;
   }, [caseData]);
 
   const handleCopyCitation = async () => {
@@ -76,7 +78,6 @@ export const CasePage: React.FC = () => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // Fallback
       const textArea = document.createElement('textarea');
       textArea.value = formattedCitation;
       document.body.appendChild(textArea);
@@ -99,7 +100,7 @@ export const CasePage: React.FC = () => {
     xl: 'text-2xl leading-[2.0]',
   }[fontSize];
 
-  // Split opinion into paragraphs to preserve natural judicial formatting
+  // Split opinion into paragraphs
   const paragraphs = useMemo(() => {
     if (!caseData?.text) return [];
     return caseData.text.split(/\n\s*\n/).filter((p) => p.trim().length > 0);
@@ -108,7 +109,7 @@ export const CasePage: React.FC = () => {
   if (isLoading) {
     return (
       <div className="min-h-screen bg-stone-50/40 dark:bg-stone-950 transition-colors py-12">
-        <div className="max-w-[70ch] mx-auto px-4 sm:px-6 animate-pulse">
+        <div className="max-w-[72ch] mx-auto px-4 sm:px-6 animate-pulse">
           <div className="h-4 bg-stone-200 dark:bg-stone-800 rounded w-24 mb-6" />
           <div className="h-8 bg-stone-200 dark:bg-stone-800 rounded w-3/4 mb-4" />
           <div className="h-4 bg-stone-100 dark:bg-stone-800/60 rounded w-1/2 mb-8" />
@@ -130,17 +131,28 @@ export const CasePage: React.FC = () => {
             <AlertCircle className="w-6 h-6" />
           </div>
           <h2 className="text-xl font-semibold text-stone-900 dark:text-stone-100 font-interface mb-2">
-            Case Opinion Not Found
+            {error === 'Case not found' ? 'Case Not Found' : "Couldn't reach the server. Try again."}
           </h2>
           <p className="text-sm text-stone-500 dark:text-stone-400 font-interface mb-6">
-            The requested judicial record could not be found or has been moved.
+            {error === 'Case not found'
+              ? 'The requested court opinion could not be located in the database.'
+              : error}
           </p>
           <div className="flex justify-center gap-3">
+            {error !== 'Case not found' && (
+              <button
+                onClick={loadCase}
+                className="inline-flex items-center gap-1.5 px-4 py-2 bg-stone-900 dark:bg-stone-100 text-white dark:text-stone-900 text-xs font-medium font-interface rounded-lg transition-colors cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Try again</span>
+              </button>
+            )}
             <button
               onClick={() => navigate('/search')}
-              className="px-4 py-2 bg-stone-900 dark:bg-stone-100 text-white dark:text-stone-900 text-xs font-medium font-interface rounded-lg transition-colors cursor-pointer"
+              className="px-4 py-2 border border-stone-200 dark:border-stone-700 bg-white dark:bg-stone-800 text-stone-700 dark:text-stone-200 text-xs font-medium font-interface rounded-lg transition-colors cursor-pointer"
             >
-              Browse all cases
+              Back to search
             </button>
           </div>
         </div>
@@ -269,7 +281,7 @@ export const CasePage: React.FC = () => {
                 <span className="text-stone-400 dark:text-stone-500 block uppercase tracking-wider text-[10px] mb-1">
                   Official Citations
                 </span>
-                <div className="flex flex-wrap gap-1.5 font-code">
+                <div className="flex flex-wrap items-center gap-1.5 font-code">
                   {caseData.citations?.map((cite, idx) => (
                     <span
                       key={idx}
@@ -278,17 +290,24 @@ export const CasePage: React.FC = () => {
                       {cite}
                     </span>
                   ))}
+                  {caseData.citation_count !== undefined && (
+                    <span className="text-xs font-interface text-stone-500 dark:text-stone-400 font-medium ml-1">
+                      (Cited by {caseData.citation_count})
+                    </span>
+                  )}
                 </div>
               </div>
 
-              <div className="text-right">
-                <span className="text-stone-400 dark:text-stone-500 block uppercase tracking-wider text-[10px] mb-1">
-                  Jurisdiction & Status
-                </span>
-                <span className="text-stone-600 dark:text-stone-300 font-medium">
-                  {caseData.jurisdiction} · {caseData.status}
-                </span>
-              </div>
+              {(caseData.jurisdiction || caseData.status) && (
+                <div className="text-right">
+                  <span className="text-stone-400 dark:text-stone-500 block uppercase tracking-wider text-[10px] mb-1">
+                    Status
+                  </span>
+                  <span className="text-stone-600 dark:text-stone-300 font-medium">
+                    {[caseData.jurisdiction, caseData.status].filter(Boolean).join(' · ')}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         </section>
@@ -297,7 +316,6 @@ export const CasePage: React.FC = () => {
         <article className="opinion-content font-opinion text-stone-800 dark:text-stone-200">
           <div className="opinion-body">
             {paragraphs.map((paragraph, index) => {
-              // Highlight judicial opening lines if they denote author, e.g., "MR. CHIEF JUSTICE..." or "JUSTICE..."
               const isJudicialHeader = /^(MR\.\s+)?(CHIEF\s+)?JUSTICE\s+[A-Z\s]+(,\s+JR\.)?\s+delivered/i.test(paragraph) ||
                 /^Before\s+[A-Z\s,]+Circuit Judges/i.test(paragraph);
 
@@ -312,7 +330,6 @@ export const CasePage: React.FC = () => {
                 );
               }
 
-              // Normal opinion paragraph with generous margins and readable serif text
               return (
                 <p
                   key={index}
@@ -328,8 +345,10 @@ export const CasePage: React.FC = () => {
         {/* Opinion End Marker */}
         <div className="mt-14 pt-8 border-t border-stone-200 dark:border-stone-800 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs font-interface text-stone-500 dark:text-stone-400 no-print">
           <div>
-            <span>End of Official Record · </span>
-            <span className="font-code">{caseData.citations?.[0]}</span>
+            <span>End of Official Record</span>
+            {caseData.citations?.[0] && (
+              <> · <span className="font-code">{caseData.citations[0]}</span></>
+            )}
           </div>
           <button
             onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}

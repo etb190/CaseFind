@@ -1,27 +1,26 @@
-export type CourtTypeCode = 'F' | 'FD' | 'FB' | 'FS';
-
 export interface CaseRecord {
-  id: string;
+  id: string | number;
   case_name: string;
-  case_name_full: string;
+  case_name_full?: string;
   court: string;
-  court_type: CourtTypeCode;
-  jurisdiction: string;
-  date_filed: string; // YYYY-MM-DD
+  court_type: string;
+  jurisdiction?: string;
+  date_filed: string;
   citations: string[];
-  citation_count: number;
-  status: string;
+  citation_count?: number;
+  status?: string;
   text: string;
 }
 
 export interface SearchResultItem {
-  id: string;
+  id: string | number;
   case_name: string;
   court: string;
-  court_type: CourtTypeCode;
+  court_type: string;
   date_filed: string;
   citations: string[];
-  citation_count: number;
+  citation_count?: number;
+  snippet?: string;
 }
 
 export interface SearchResponse {
@@ -32,7 +31,11 @@ export interface SearchResponse {
 }
 
 export interface CourtOption {
-  value: CourtTypeCode | string;
+  value: string;
   label: string;
-  count: number;
+  count?: number;
+}
+
+export interface FeaturesResponse {
+  semantic: boolean;
 }

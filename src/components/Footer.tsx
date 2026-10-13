@@ -8,7 +8,7 @@ export const Footer: React.FC = () => {
     <footer className="w-full border-t border-stone-200 dark:border-stone-800 bg-white dark:bg-stone-900 transition-colors py-8 no-print">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs font-interface text-stone-500 dark:text-stone-400">
         <div className="flex items-center gap-2">
-          <span className="font-medium text-stone-700 dark:text-stone-300">JurisSearch</span>
+          <span className="font-medium text-stone-700 dark:text-stone-300">CaseFind</span>
           <span aria-hidden="true">·</span>
           <span>United States Federal Court Opinions Database</span>
         </div>

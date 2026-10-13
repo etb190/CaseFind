@@ -1,15 +1,15 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { useRouter } from '../context/RouterContext';
-import { fetchSearch, fetchCourts } from '../services/api';
-import { SearchResponse, SearchResultItem, CourtOption, CourtTypeCode } from '../types';
-import { Search, Filter, Calendar, ChevronLeft, ChevronRight, AlertCircle, RefreshCw, Scale, ArrowUpRight } from 'lucide-react';
+import { fetchSearch, fetchCourts, fetchFeatures } from '../services/api';
+import { SearchResponse, SearchResultItem, CourtOption } from '../types';
+import { Search, ChevronLeft, ChevronRight, AlertCircle, RefreshCw, Scale, ArrowUpRight, Sparkles } from 'lucide-react';
 
-const COURT_NAME_MAP: Record<string, string> = {
-  F: 'Appeals / Supreme Court',
-  FD: 'District Court',
-  FB: 'Bankruptcy Court',
-  FS: 'Special Jurisdiction',
-};
+const DEFAULT_COURT_OPTIONS: CourtOption[] = [
+  { value: 'F', label: 'Appeals' },
+  { value: 'FD', label: 'District' },
+  { value: 'FB', label: 'Bankruptcy' },
+  { value: 'FS', label: 'Special' },
+];
 
 export const SearchPage: React.FC = () => {
   const { searchParams, navigate } = useRouter();
@@ -19,6 +19,7 @@ export const SearchPage: React.FC = () => {
   const yearFromParam = searchParams.get('year_from') ?? '';
   const yearToParam = searchParams.get('year_to') ?? '';
   const pageParam = parseInt(searchParams.get('page') ?? '1', 10) || 1;
+  const modeParam = (searchParams.get('mode') === 'concept' ? 'concept' : 'keyword') as 'keyword' | 'concept';
 
   const [inputQuery, setInputQuery] = useState(q);
   const [selectedCourts, setSelectedCourts] = useState<string[]>(
@@ -26,25 +27,49 @@ export const SearchPage: React.FC = () => {
   );
   const [yearFrom, setYearFrom] = useState(yearFromParam);
   const [yearTo, setYearTo] = useState(yearToParam);
+  const [searchMode, setSearchMode] = useState<'keyword' | 'concept'>(modeParam);
+  const [semanticSupported, setSemanticSupported] = useState(false);
 
-  const [courts, setCourts] = useState<CourtOption[]>([]);
+  const [courts, setCourts] = useState<CourtOption[]>(DEFAULT_COURT_OPTIONS);
   const [data, setData] = useState<SearchResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Sync inputs with URL params whenever URL changes
+  // Sync state with URL query parameters
   useEffect(() => {
     setInputQuery(q);
     setSelectedCourts(courtTypeParam ? courtTypeParam.split(',').filter(Boolean) : []);
     setYearFrom(yearFromParam);
     setYearTo(yearToParam);
-  }, [q, courtTypeParam, yearFromParam, yearToParam]);
+    setSearchMode(modeParam);
+  }, [q, courtTypeParam, yearFromParam, yearToParam, modeParam]);
 
-  // Load court counts for filter options
+  // Check features (e.g. semantic concept search support)
   useEffect(() => {
+    let mounted = true;
+    fetchFeatures()
+      .then((res) => {
+        if (mounted) {
+          setSemanticSupported(Boolean(res?.semantic));
+        }
+      })
+      .catch(() => {
+        if (mounted) setSemanticSupported(false);
+      });
+
     fetchCourts()
-      .then((res) => setCourts(res))
-      .catch((err) => console.error('Error fetching courts:', err));
+      .then((res) => {
+        if (mounted && res && res.length > 0) {
+          setCourts(res);
+        }
+      })
+      .catch(() => {
+        // Keep default court labels
+      });
+
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   // Fetch search results
@@ -52,38 +77,43 @@ export const SearchPage: React.FC = () => {
     setIsLoading(true);
     setError(null);
 
-    fetchSearch({
-      q,
-      court_type: courtTypeParam,
-      year_from: yearFromParam,
-      year_to: yearToParam,
-      page: pageParam,
-    })
+    const isConcept = searchMode === 'concept' && semanticSupported;
+
+    fetchSearch(
+      {
+        q,
+        court_type: courtTypeParam,
+        year_from: yearFromParam,
+        year_to: yearToParam,
+        page: pageParam,
+      },
+      isConcept
+    )
       .then((res) => {
         setData(res);
         setIsLoading(false);
       })
       .catch((err: any) => {
-        console.error('Search fetch error:', err);
-        setError(err.message || 'An error occurred while fetching cases.');
+        setError(err.message || "Couldn't reach the server. Try again.");
         setIsLoading(false);
       });
-  }, [q, courtTypeParam, yearFromParam, yearToParam, pageParam]);
+  }, [q, courtTypeParam, yearFromParam, yearToParam, pageParam, searchMode, semanticSupported]);
 
   useEffect(() => {
     loadResults();
   }, [loadResults]);
 
-  // Execute update to URL search params
+  // Update URL search params
   const updateSearchUrl = (updates: {
     q?: string;
     courts?: string[];
     yearFrom?: string;
     yearTo?: string;
     page?: number;
+    mode?: 'keyword' | 'concept';
   }) => {
     const params = new URLSearchParams();
-    
+
     const newQ = updates.q !== undefined ? updates.q : q;
     if (newQ.trim()) {
       params.set('q', newQ.trim());
@@ -102,6 +132,11 @@ export const SearchPage: React.FC = () => {
     const newYearTo = updates.yearTo !== undefined ? updates.yearTo : yearTo;
     if (newYearTo.trim()) {
       params.set('year_to', newYearTo.trim());
+    }
+
+    const newMode = updates.mode !== undefined ? updates.mode : searchMode;
+    if (newMode === 'concept' && semanticSupported) {
+      params.set('mode', 'concept');
     }
 
     const newPage = updates.page !== undefined ? updates.page : 1;
@@ -134,6 +169,11 @@ export const SearchPage: React.FC = () => {
     setYearFrom('');
     setYearTo('');
     updateSearchUrl({ courts: [], yearFrom: '', yearTo: '', page: 1 });
+  };
+
+  const handleModeChange = (mode: 'keyword' | 'concept') => {
+    setSearchMode(mode);
+    updateSearchUrl({ mode, page: 1 });
   };
 
   const handlePageChange = (newPage: number) => {
@@ -185,16 +225,11 @@ export const SearchPage: React.FC = () => {
             </div>
           </form>
 
-          {/* Active Filters Row */}
+          {/* Active Filters Row & Concept Switch */}
           <div className="mt-4 pt-3 border-t border-stone-100 dark:border-stone-800 flex flex-wrap items-center justify-between gap-3 text-xs font-interface">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-stone-400 dark:text-stone-500 font-medium mr-1">Courts:</span>
-              {(courts.length > 0 ? courts : [
-                { value: 'F', label: 'Appeals', count: 0 },
-                { value: 'FD', label: 'District', count: 0 },
-                { value: 'FB', label: 'Bankruptcy', count: 0 },
-                { value: 'FS', label: 'Special', count: 0 },
-              ]).map((c) => {
+              {courts.map((c) => {
                 const active = selectedCourts.includes(c.value);
                 return (
                   <button
@@ -208,42 +243,75 @@ export const SearchPage: React.FC = () => {
                     }`}
                   >
                     <span>{c.label.replace('U.S. ', '').replace(' Courts', '')}</span>
+                    {c.count !== undefined && (
+                      <span className="ml-1 text-[11px] opacity-70">({c.count})</span>
+                    )}
                   </button>
                 );
               })}
             </div>
 
-            {/* Year Inputs */}
-            <div className="flex items-center gap-2">
-              <span className="text-stone-400 dark:text-stone-500 font-medium">Years:</span>
-              <input
-                type="number"
-                placeholder="From"
-                value={yearFrom}
-                onChange={(e) => setYearFrom(e.target.value)}
-                onBlur={handleApplyYearFilter}
-                onKeyDown={(e) => e.key === 'Enter' && handleApplyYearFilter()}
-                className="w-18 px-2 py-1 rounded border border-stone-200 dark:border-stone-700 bg-stone-50/50 dark:bg-stone-800/50 text-xs text-stone-900 dark:text-stone-100 font-interface focus:outline-none focus:ring-1 focus:ring-stone-400"
-              />
-              <span className="text-stone-400">–</span>
-              <input
-                type="number"
-                placeholder="To"
-                value={yearTo}
-                onChange={(e) => setYearTo(e.target.value)}
-                onBlur={handleApplyYearFilter}
-                onKeyDown={(e) => e.key === 'Enter' && handleApplyYearFilter()}
-                className="w-18 px-2 py-1 rounded border border-stone-200 dark:border-stone-700 bg-stone-50/50 dark:bg-stone-800/50 text-xs text-stone-900 dark:text-stone-100 font-interface focus:outline-none focus:ring-1 focus:ring-stone-400"
-              />
-              {(selectedCourts.length > 0 || yearFrom || yearTo) && (
-                <button
-                  type="button"
-                  onClick={handleResetFilters}
-                  className="ml-2 text-stone-500 hover:text-stone-900 dark:hover:text-stone-200 underline cursor-pointer"
-                >
-                  Reset
-                </button>
+            {/* Year Inputs and Semantic Concept Switch */}
+            <div className="flex flex-wrap items-center gap-3">
+              {semanticSupported && (
+                <div className="inline-flex items-center p-0.5 rounded-lg bg-stone-100 dark:bg-stone-800 border border-stone-200 dark:border-stone-700">
+                  <button
+                    type="button"
+                    onClick={() => handleModeChange('keyword')}
+                    className={`px-2.5 py-0.5 rounded text-xs transition-colors cursor-pointer ${
+                      searchMode === 'keyword'
+                        ? 'bg-white dark:bg-stone-900 text-stone-900 dark:text-stone-100 font-medium shadow-xs'
+                        : 'text-stone-500 hover:text-stone-900 dark:hover:text-stone-100'
+                    }`}
+                  >
+                    Keyword
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleModeChange('concept')}
+                    className={`px-2.5 py-0.5 rounded text-xs transition-colors flex items-center gap-1 cursor-pointer ${
+                      searchMode === 'concept'
+                        ? 'bg-white dark:bg-stone-900 text-stone-900 dark:text-stone-100 font-medium shadow-xs'
+                        : 'text-stone-500 hover:text-stone-900 dark:hover:text-stone-100'
+                    }`}
+                  >
+                    <Sparkles className="w-3 h-3 text-amber-500" />
+                    <span>Concept</span>
+                  </button>
+                </div>
               )}
+
+              <div className="flex items-center gap-2">
+                <span className="text-stone-400 dark:text-stone-500 font-medium">Years:</span>
+                <input
+                  type="number"
+                  placeholder="From"
+                  value={yearFrom}
+                  onChange={(e) => setYearFrom(e.target.value)}
+                  onBlur={handleApplyYearFilter}
+                  onKeyDown={(e) => e.key === 'Enter' && handleApplyYearFilter()}
+                  className="w-18 px-2 py-1 rounded border border-stone-200 dark:border-stone-700 bg-stone-50/50 dark:bg-stone-800/50 text-xs text-stone-900 dark:text-stone-100 font-interface focus:outline-none focus:ring-1 focus:ring-stone-400"
+                />
+                <span className="text-stone-400">–</span>
+                <input
+                  type="number"
+                  placeholder="To"
+                  value={yearTo}
+                  onChange={(e) => setYearTo(e.target.value)}
+                  onBlur={handleApplyYearFilter}
+                  onKeyDown={(e) => e.key === 'Enter' && handleApplyYearFilter()}
+                  className="w-18 px-2 py-1 rounded border border-stone-200 dark:border-stone-700 bg-stone-50/50 dark:bg-stone-800/50 text-xs text-stone-900 dark:text-stone-100 font-interface focus:outline-none focus:ring-1 focus:ring-stone-400"
+                />
+                {(selectedCourts.length > 0 || yearFrom || yearTo) && (
+                  <button
+                    type="button"
+                    onClick={handleResetFilters}
+                    className="ml-1 text-stone-500 hover:text-stone-900 dark:hover:text-stone-200 underline cursor-pointer"
+                  >
+                    Reset
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -286,14 +354,14 @@ export const SearchPage: React.FC = () => {
           </div>
         )}
 
-        {/* Error State */}
+        {/* Error State: Clear error message as requested */}
         {!isLoading && error && (
           <div className="bg-white dark:bg-stone-900 rounded-xl border border-rose-200 dark:border-rose-900/40 p-8 text-center my-6">
             <div className="w-12 h-12 rounded-full bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 mx-auto flex items-center justify-center mb-3">
               <AlertCircle className="w-6 h-6" />
             </div>
             <h3 className="text-base font-semibold text-stone-900 dark:text-stone-100 font-interface mb-1">
-              Unable to complete legal search
+              Couldn&apos;t reach the server. Try again.
             </h3>
             <p className="text-sm text-stone-500 dark:text-stone-400 max-w-md mx-auto font-interface mb-4">
               {error}
@@ -318,7 +386,7 @@ export const SearchPage: React.FC = () => {
               No federal court opinions found
             </h3>
             <p className="text-sm text-stone-500 dark:text-stone-400 max-w-md mx-auto font-interface mb-6">
-              We couldn&apos;t find any opinions matching your search criteria. Try broadening your keywords, adjusting the year range, or clearing filters.
+              We couldn&apos;t find any opinions matching your search criteria. Try broadening your keywords or clearing filters.
             </p>
             <div className="flex flex-wrap justify-center gap-3">
               <button
@@ -342,22 +410,29 @@ export const SearchPage: React.FC = () => {
           <div className="space-y-3.5">
             {data.results.map((c: SearchResultItem) => (
               <article
-                key={c.id}
+                key={String(c.id)}
                 className="group bg-white dark:bg-stone-900 rounded-xl border border-stone-200 dark:border-stone-800 p-5 sm:p-6 hover:border-stone-400 dark:hover:border-stone-600 transition-all shadow-2xs hover:shadow-xs"
               >
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1 min-w-0">
                     
-                    {/* Case Name Link */}
+                    {/* Case Name Link - ID treated as opaque value */}
                     <h2 className="text-lg sm:text-xl font-semibold text-stone-900 dark:text-stone-100 group-hover:text-blue-700 dark:group-hover:text-blue-400 font-interface transition-colors mb-2">
                       <button
-                        onClick={() => navigate(`/case/${c.id}`)}
+                        onClick={() => navigate(`/case/${encodeURIComponent(String(c.id))}`)}
                         className="text-left cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-stone-400 rounded-sm inline-flex items-baseline gap-1"
                       >
                         <span>{c.case_name}</span>
                         <ArrowUpRight className="w-4 h-4 opacity-0 group-hover:opacity-100 transition-opacity inline shrink-0 text-stone-400" />
                       </button>
                     </h2>
+
+                    {/* Concept Snippet if present */}
+                    {c.snippet && (
+                      <p className="text-sm text-stone-600 dark:text-stone-300 font-opinion italic mb-3 leading-relaxed bg-stone-50 dark:bg-stone-800/40 p-2.5 rounded-lg border border-stone-100 dark:border-stone-800">
+                        &ldquo;{c.snippet}&rdquo;
+                      </p>
+                    )}
 
                     {/* Metadata Strip: Clean unboxed metadata with typographic separators */}
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-stone-500 dark:text-stone-400 font-interface mb-3">
@@ -368,10 +443,22 @@ export const SearchPage: React.FC = () => {
                       <span>
                         Filed {c.date_filed}
                       </span>
-                      <span aria-hidden="true">·</span>
-                      <span className="text-stone-600 dark:text-stone-300">
-                        {COURT_NAME_MAP[c.court_type] || c.court_type}
-                      </span>
+                      {c.court_type && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-stone-600 dark:text-stone-300">
+                            {c.court_type}
+                          </span>
+                        </>
+                      )}
+                      {c.citation_count !== undefined && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-stone-700 dark:text-stone-300 font-medium tabular-nums">
+                            Cited by {c.citation_count}
+                          </span>
+                        </>
+                      )}
                     </div>
 
                     {/* Citations list */}
@@ -388,9 +475,6 @@ export const SearchPage: React.FC = () => {
                             {cite}
                           </span>
                         ))}
-                        <span className="text-stone-400 text-[11px] font-interface ml-1">
-                          ({c.citation_count} cited)
-                        </span>
                       </div>
                     )}
                   </div>
@@ -398,7 +482,7 @@ export const SearchPage: React.FC = () => {
                   {/* Read opinion button */}
                   <div className="hidden sm:block shrink-0">
                     <button
-                      onClick={() => navigate(`/case/${c.id}`)}
+                      onClick={() => navigate(`/case/${encodeURIComponent(String(c.id))}`)}
                       className="px-3.5 py-1.5 text-xs font-medium font-interface rounded-lg border border-stone-200 dark:border-stone-700 text-stone-700 dark:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors cursor-pointer"
                     >
                       Read Opinion
