@@ -111,48 +111,72 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    # 1. Courts
-    rd, p = stream_csv("courts", date_str)
-    federal_courts = {}
-    for r in rd:
-        juris = r.get("jurisdiction", "")
-        cid = r.get("id", "")
-        if cid in FEDERAL_APPELLATE or juris in ("F", "FD", "FB", "FS"):
-            if not include_districts and juris not in ("F",):
-                continue
-            federal_courts[cid] = (cid, juris)
-    p.kill()
-    print(f"[courts] Loaded {len(federal_courts):,} qualifying federal courts in {time.time()-t0:.1f}s")
-
-    # 2. Dockets
-    t_dock = time.time()
-    rd, p = stream_csv("dockets", date_str)
-    federal_dockets = {}
-    for i, r in enumerate(rd):
-        court_id = r.get("court_id", "")
-        if court_id in federal_courts:
-            federal_dockets[r["id"]] = court_id
-        if i > 0 and i % 2_000_000 == 0:
-            print(f"  [dockets] scanned {i:,} | federal matches: {len(federal_dockets):,} ({time.time()-t_dock:.0f}s)", flush=True)
-    p.kill()
-    print(f"[dockets] Found {len(federal_dockets):,} federal dockets in {time.time()-t_dock:.1f}s")
-
-    # 3. Opinion Clusters (case names, dates, citations)
-    t_clus = time.time()
-    rd, p = stream_csv("opinion-clusters", date_str)
     clusters = {}
-    for i, r in enumerate(rd):
-        doc_id = r.get("docket_id", "")
-        if doc_id in federal_dockets:
-            clusters[r["id"]] = {
-                "court": federal_dockets[doc_id],
-                "case_name": r.get("case_name", "Unknown Case"),
-                "date_filed": r.get("date_filed", ""),
-                "citations": r.get("citations", "[]"),
-                "citation_count": int(r.get("citation_count", 0) or 0)
-            }
-        if i > 0 and i % 1_000_000 == 0:
-            print(f"  [clusters] scanned {i:,} | federal clusters: {len(clusters):,} ({time.time()-t_clus:.0f}s)", flush=True)
+
+    # Check if local clus.pkl cache exists to skip dockets & clusters scans
+    if os.path.exists("clus.pkl"):
+        try:
+            import pickle
+            with open("clus.pkl", "rb") as f:
+                cached = pickle.load(f)
+            if cached and isinstance(cached, dict):
+                for k, v in cached.items():
+                    if isinstance(v, (list, tuple)) and len(v) >= 3:
+                        clusters[str(k)] = {
+                            "court": v[0],
+                            "case_name": v[1],
+                            "date_filed": v[2],
+                            "citations": "[]",
+                            "citation_count": 0
+                        }
+                print(f"[clusters] Loaded {len(clusters):,} federal clusters from clus.pkl (skipped scan!)")
+        except Exception as e:
+            print(f"[clusters] Note on clus.pkl cache: {e}")
+
+    if not clusters:
+        # 1. Courts
+        rd, p = stream_csv("courts", date_str)
+        federal_courts = {}
+        for r in rd:
+            juris = r.get("jurisdiction", "")
+            cid = r.get("id", "")
+            if cid in FEDERAL_APPELLATE or juris in ("F", "FD", "FB", "FS"):
+                if not include_districts and juris not in ("F",):
+                    continue
+                federal_courts[cid] = (cid, juris)
+        p.kill()
+        print(f"[courts] Loaded {len(federal_courts):,} qualifying federal courts in {time.time()-t0:.1f}s")
+
+        # 2. Dockets
+        t_dock = time.time()
+        rd, p = stream_csv("dockets", date_str)
+        federal_dockets = {}
+        for i, r in enumerate(rd):
+            court_id = r.get("court_id", "")
+            if court_id in federal_courts:
+                federal_dockets[r["id"]] = court_id
+            if i > 0 and i % 2_000_000 == 0:
+                print(f"  [dockets] scanned {i:,} | federal matches: {len(federal_dockets):,} ({time.time()-t_dock:.0f}s)", flush=True)
+        p.kill()
+        print(f"[dockets] Found {len(federal_dockets):,} federal dockets in {time.time()-t_dock:.1f}s")
+
+        # 3. Opinion Clusters (case names, dates, citations)
+        t_clus = time.time()
+        rd, p = stream_csv("opinion-clusters", date_str)
+        for i, r in enumerate(rd):
+            doc_id = r.get("docket_id", "")
+            if doc_id in federal_dockets:
+                clusters[r["id"]] = {
+                    "court": federal_dockets[doc_id],
+                    "case_name": r.get("case_name", "Unknown Case"),
+                    "date_filed": r.get("date_filed", ""),
+                    "citations": r.get("citations", "[]"),
+                    "citation_count": int(r.get("citation_count", 0) or 0)
+                }
+            if i > 0 and i % 1_000_000 == 0:
+                print(f"  [clusters] scanned {i:,} | federal clusters: {len(clusters):,} ({time.time()-t_clus:.0f}s)", flush=True)
+        p.kill()
+        print(f"[clusters] Found {len(clusters):,} federal case clusters in {time.time()-t_clus:.1f}s")
     p.kill()
     print(f"[clusters] Found {len(clusters):,} federal case clusters in {time.time()-t_clus:.1f}s")
 
