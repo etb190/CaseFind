@@ -118,13 +118,27 @@ def is_bankruptcy_court(court_id, jurisdiction=""):
     cid = (court_id or "").lower()
     return jurisdiction == "FB" or "bankr" in cid or "bap" in cid or (len(cid) >= 3 and cid.endswith("b") and cid not in ("scotus", "cabc"))
 
-def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_districts=True, include_bankruptcy=False, court_filter=None):
+def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_districts=True, include_bankruptcy=False, court_filter=None, resume=False):
     ensure_lbzip2()
+    
+    # If resuming, do not clear the database
+    if resume:
+        clear = False
+
     init_db(DB_PATH, clear=clear)
 
     t0 = time.time()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    existing_ids = set()
+    if resume or not clear:
+        try:
+            existing_ids = set(r[0] for r in cur.execute("SELECT id FROM cases").fetchall())
+            if existing_ids:
+                print(f"[resume] Found {len(existing_ids):,} cases already in {DB_PATH} - will skip duplicates and append.")
+        except Exception as e:
+            print(f"[resume] Note on existing cases check: {e}")
 
     clusters = {}
 
@@ -242,11 +256,14 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
     for i, r in enumerate(rd):
         clus_id = r.get("cluster_id")
         if clus_id in clusters:
+            case_id = str(r.get("id") or clus_id)
+            if case_id in existing_ids:
+                continue
+
             text = clean_text(r)
             if len(text) >= MIN_CHARS:
                 c_info = clusters[clus_id]
                 c_type = map_court_category(c_info["court"])
-                case_id = r.get("id") or str(clus_id)
 
                 batch.append((
                     str(case_id),
@@ -320,6 +337,7 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None, help="Stop after N cases (omit to ingest all)")
     parser.add_argument("--date", type=str, default=DEFAULT_DATE, help="CourtListener dump date (YYYY-MM-DD)")
     parser.add_argument("--keep-existing", action="store_true", help="Append without clearing previous DB")
+    parser.add_argument("--resume", action="store_true", help="Resume ingestion without clearing previously saved cases")
     parser.add_argument("--appeals-only", action="store_true", help="Ingest only Supreme Court and Circuit Appeals")
     parser.add_argument("--include-bankruptcy", action="store_true", help="Also ingest bankruptcy courts (excluded by default)")
     parser.add_argument("--court", type=str, default=None, help="Restrict ingestion to one court id (e.g. scotus, ca9, nyed)")
@@ -328,8 +346,9 @@ if __name__ == "__main__":
     run_ingest(
         date_str=args.date,
         target_count=args.limit,
-        clear=not args.keep_existing,
+        clear=not (args.keep_existing or args.resume),
         include_districts=not args.appeals_only,
         include_bankruptcy=args.include_bankruptcy,
-        court_filter=(args.court.lower() if args.court else None)
+        court_filter=(args.court.lower() if args.court else None),
+        resume=(args.resume or args.keep_existing)
     )
