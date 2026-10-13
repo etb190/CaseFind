@@ -103,9 +103,30 @@ def search():
     conditions = []
     params = []
 
+    # Check for FTS5 full-text table
+    has_fts = False
+    try:
+        fts_check = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cases_fts'").fetchone()
+        has_fts = bool(fts_check)
+    except Exception:
+        has_fts = False
+
     if q:
-        conditions.append(f"({name_col} LIKE ? OR {text_col} LIKE ?)")
-        params.extend([f"%{q}%", f"%{q}%"])
+        clean_q = re.sub(r'[^a-zA-Z0-9\s"]', ' ', q).strip()
+        if has_fts and clean_q:
+            # FTS5 fast full-text search
+            fts_query = " ".join([f'"{w}"' for w in clean_q.split() if w])
+            conditions.append(f"rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?)")
+            params.append(fts_query)
+        else:
+            conditions.append(f"({name_col} LIKE ? OR {text_col} LIKE ?)")
+            params.extend([f"%{q}%", f"%{q}%"])
+
+    court_filter = [c.strip().upper() for c in court_type.split(",") if c.strip()]
+    if court_filter and "court_type" in cols:
+        placeholders = ",".join(["?"] * len(court_filter))
+        conditions.append(f"court_type IN ({placeholders})")
+        params.extend(court_filter)
 
     if year_from:
         conditions.append(f"SUBSTR({date_col}, 1, 4) >= ?")
@@ -135,13 +156,8 @@ def search():
     conn.close()
 
     results = []
-    court_filter = [c.strip() for c in court_type.split(",") if c.strip()]
-
     for r in rows:
         c_type = map_court_type(r["court"])
-        if court_filter and c_type not in court_filter:
-            continue
-
         raw_cites = r["citations"] if cite_col else []
         cites = format_citations(raw_cites)
 
