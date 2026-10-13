@@ -2,13 +2,14 @@ import React, { useState, useEffect } from 'react';
 import { useRouter } from '../context/RouterContext';
 import { fetchCourts, fetchFeatures } from '../services/api';
 import { CourtOption } from '../types';
+import { CourtSelect, ScopeSelect, SearchScope } from '../components/Filters';
 import { Search, SlidersHorizontal, ArrowRight, Building2, Sparkles } from 'lucide-react';
 
 const FALLBACK_COURTS: CourtOption[] = [
-  { value: 'F', label: 'Appeals' },
-  { value: 'FD', label: 'District' },
-  { value: 'FB', label: 'Bankruptcy' },
-  { value: 'FS', label: 'Special' },
+  { value: 'SCOTUS', label: 'Supreme Court' },
+  { value: 'F', label: 'Appeals Courts' },
+  { value: 'FD', label: 'District Courts' },
+  { value: 'FS', label: 'Special Jurisdiction' },
 ];
 
 const SUGGESTED_SEARCHES = [
@@ -23,7 +24,8 @@ const SUGGESTED_SEARCHES = [
 export const HomePage: React.FC = () => {
   const { navigate } = useRouter();
   const [query, setQuery] = useState('');
-  const [selectedCourts, setSelectedCourts] = useState<string[]>([]);
+  const [selectedCourt, setSelectedCourt] = useState('');
+  const [scope, setScope] = useState<SearchScope>('title');
   const [yearFrom, setYearFrom] = useState('');
   const [yearTo, setYearTo] = useState('');
   const [courts, setCourts] = useState<CourtOption[]>(FALLBACK_COURTS);
@@ -57,12 +59,6 @@ export const HomePage: React.FC = () => {
     };
   }, []);
 
-  const toggleCourt = (courtVal: string) => {
-    setSelectedCourts((prev) =>
-      prev.includes(courtVal) ? prev.filter((c) => c !== courtVal) : [...prev, courtVal]
-    );
-  };
-
   const setYearPreset = (from: string, to: string) => {
     setYearFrom(from);
     setYearTo(to);
@@ -74,8 +70,9 @@ export const HomePage: React.FC = () => {
     if (query.trim()) {
       params.set('q', query.trim());
     }
-    if (selectedCourts.length > 0) {
-      params.set('court_type', selectedCourts.join(','));
+    params.set('scope', scope);
+    if (selectedCourt) {
+      params.set('court_type', selectedCourt);
     }
     if (yearFrom.trim()) {
       params.set('year_from', yearFrom.trim());
@@ -105,7 +102,7 @@ export const HomePage: React.FC = () => {
             Search Federal Court Opinions
           </h1>
           <p className="text-base text-stone-600 dark:text-stone-400 max-w-xl font-interface">
-            Instant full-text access across U.S. Supreme Court, Circuit Courts of Appeals, District, and Bankruptcy decisions.
+            Instant full-text access across U.S. Supreme Court, Circuit Courts of Appeals, District, and Special Jurisdiction decisions.
           </p>
         </div>
 
@@ -132,6 +129,12 @@ export const HomePage: React.FC = () => {
                 <ArrowRight className="w-4 h-4 hidden sm:inline" />
               </button>
             </div>
+          </div>
+
+          {/* Search Scope Selector: case name vs opinion text */}
+          <div className="flex items-center justify-end mt-2.5 gap-2">
+            <span className="text-xs text-stone-400 dark:text-stone-500 font-interface">Search in:</span>
+            <ScopeSelect value={scope} onChange={setScope} />
           </div>
 
           {/* Concept Search Switch - Shown ONLY when GET /api/features returns { semantic: true } */}
@@ -173,11 +176,11 @@ export const HomePage: React.FC = () => {
               <SlidersHorizontal className="w-3.5 h-3.5" />
               <span>Search Filters</span>
             </div>
-            {(selectedCourts.length > 0 || yearFrom || yearTo) && (
+            {(selectedCourt || yearFrom || yearTo) && (
               <button
                 type="button"
                 onClick={() => {
-                  setSelectedCourts([]);
+                  setSelectedCourt('');
                   setYearFrom('');
                   setYearTo('');
                 }}
@@ -189,35 +192,19 @@ export const HomePage: React.FC = () => {
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {/* Court Type Filter */}
+            {/* Court Type Filter - Dropdown: All / Supreme / Appeals / District / Special */}
             <div>
               <label className="block text-xs font-medium text-stone-700 dark:text-stone-300 font-interface mb-2.5">
-                Court Type
+                Court
               </label>
-              <div className="grid grid-cols-2 gap-2">
-                {courts.map((court) => {
-                  const isChecked = selectedCourts.includes(court.value);
-                  return (
-                    <button
-                      key={court.value}
-                      type="button"
-                      onClick={() => toggleCourt(court.value)}
-                      className={`flex items-center justify-between px-3 py-2 rounded-lg border text-xs font-interface transition-all cursor-pointer text-left ${
-                        isChecked
-                          ? 'border-stone-800 bg-stone-900 text-white dark:border-stone-200 dark:bg-stone-100 dark:text-stone-900 font-medium'
-                          : 'border-stone-200 dark:border-stone-700 bg-stone-50/50 dark:bg-stone-800/50 text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-stone-800'
-                      }`}
-                    >
-                      <span className="truncate mr-1">{court.label}</span>
-                      {court.count !== undefined && (
-                        <span className={`text-[11px] tabular-nums shrink-0 ${isChecked ? 'opacity-80' : 'text-stone-400'}`}>
-                          {court.count}
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
+              <CourtSelect
+                courts={courts}
+                value={selectedCourt}
+                onChange={setSelectedCourt}
+              />
+              <p className="mt-2 text-[11px] text-stone-400 dark:text-stone-500 font-interface">
+                Bankruptcy cases are excluded.
+              </p>
             </div>
 
             {/* Year Range Filter */}

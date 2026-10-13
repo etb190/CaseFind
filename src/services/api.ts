@@ -2,6 +2,7 @@ import { SearchResponse, CaseRecord, CourtOption, FeaturesResponse } from '../ty
 
 export interface SearchQueryParams {
   q?: string;
+  scope?: 'title' | 'text' | 'both';
   court_type?: string;
   year_from?: string | number;
   year_to?: string | number;
@@ -15,6 +16,9 @@ function buildSearchParams(params: SearchQueryParams): string {
   const searchParams = new URLSearchParams();
   if (params.q !== undefined && params.q !== '') {
     searchParams.set('q', params.q);
+  }
+  if (params.scope) {
+    searchParams.set('scope', params.scope);
   }
   if (params.court_type) {
     searchParams.set('court_type', params.court_type);

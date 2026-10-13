@@ -95,15 +95,22 @@ def clean_text(raw_row):
 
 def map_court_category(court_id, jurisdiction="F"):
     cid = (court_id or "").lower()
+    if cid == "scotus":
+        return "SCOTUS"
     if cid in FEDERAL_APPELLATE or jurisdiction == "F":
         return "F"
-    elif "bankr" in cid or jurisdiction == "FB":
+    elif "bankr" in cid or "bap" in cid or jurisdiction == "FB":
         return "FB"
     elif any(k in cid for k in ["claim", "trade", "tax"]) or jurisdiction == "FS":
         return "FS"
     return "FD"
 
-def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_districts=True):
+def is_bankruptcy_court(court_id, jurisdiction=""):
+    """Bankruptcy courts (and BAPs) - CourtListener jurisdiction 'FB' or id patterns."""
+    cid = (court_id or "").lower()
+    return jurisdiction == "FB" or "bankr" in cid or "bap" in cid or (len(cid) >= 3 and cid.endswith("b") and cid not in ("scotus", "cabc"))
+
+def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_districts=True, include_bankruptcy=False):
     ensure_lbzip2()
     init_db(DB_PATH, clear=clear)
 
@@ -137,15 +144,20 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
         # 1. Courts
         rd, p = stream_csv("courts", date_str)
         federal_courts = {}
+        skipped_bankruptcy = 0
         for r in rd:
             juris = r.get("jurisdiction", "")
             cid = r.get("id", "")
             if cid in FEDERAL_APPELLATE or juris in ("F", "FD", "FB", "FS"):
+                # Exclude bankruptcy courts entirely unless explicitly requested
+                if not include_bankruptcy and is_bankruptcy_court(cid, juris):
+                    skipped_bankruptcy += 1
+                    continue
                 if not include_districts and juris not in ("F",):
                     continue
                 federal_courts[cid] = (cid, juris)
         p.kill()
-        print(f"[courts] Loaded {len(federal_courts):,} qualifying federal courts in {time.time()-t0:.1f}s")
+        print(f"[courts] Loaded {len(federal_courts):,} qualifying federal courts in {time.time()-t0:.1f}s" + (f" (excluded {skipped_bankruptcy:,} bankruptcy courts)" if skipped_bankruptcy else ""))
 
         # 2. Dockets
         t_dock = time.time()
@@ -177,8 +189,6 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
                 print(f"  [clusters] scanned {i:,} | federal clusters: {len(clusters):,} ({time.time()-t_clus:.0f}s)", flush=True)
         p.kill()
         print(f"[clusters] Found {len(clusters):,} federal case clusters in {time.time()-t_clus:.1f}s")
-    p.kill()
-    print(f"[clusters] Found {len(clusters):,} federal case clusters in {time.time()-t_clus:.1f}s")
 
     # 4. Stream Opinions and insert into SQLite
     t_ops = time.time()
@@ -272,11 +282,13 @@ if __name__ == "__main__":
     parser.add_argument("--date", type=str, default=DEFAULT_DATE, help="CourtListener dump date (YYYY-MM-DD)")
     parser.add_argument("--keep-existing", action="store_true", help="Append without clearing previous DB")
     parser.add_argument("--appeals-only", action="store_true", help="Ingest only Supreme Court and Circuit Appeals")
+    parser.add_argument("--include-bankruptcy", action="store_true", help="Also ingest bankruptcy courts (excluded by default)")
     args = parser.parse_args()
 
     run_ingest(
         date_str=args.date,
         target_count=args.limit,
         clear=not args.keep_existing,
-        include_districts=not args.appeals_only
+        include_districts=not args.appeals_only,
+        include_bankruptcy=args.include_bankruptcy
     )

@@ -53,12 +53,6 @@ export const Header: React.FC = () => {
           >
             Browse All Opinions
           </button>
-          <button
-            onClick={() => navigate('/search?court_type=FB')}
-            className="cursor-pointer transition-colors hover:text-stone-900 dark:hover:text-stone-100 text-stone-500 dark:text-stone-400"
-          >
-            Bankruptcy
-          </button>
         </nav>
 
         {/* Zone 3: Actions (Theme Toggle & Search Quick Button) */}

@@ -2,13 +2,14 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { useRouter } from '../context/RouterContext';
 import { fetchSearch, fetchCourts, fetchFeatures } from '../services/api';
 import { SearchResponse, SearchResultItem, CourtOption } from '../types';
+import { CourtSelect, ScopeSelect, COURT_TYPE_LABELS, SearchScope } from '../components/Filters';
 import { Search, ChevronLeft, ChevronRight, AlertCircle, RefreshCw, Scale, ArrowUpRight, Sparkles } from 'lucide-react';
 
 const DEFAULT_COURT_OPTIONS: CourtOption[] = [
-  { value: 'F', label: 'Appeals' },
-  { value: 'FD', label: 'District' },
-  { value: 'FB', label: 'Bankruptcy' },
-  { value: 'FS', label: 'Special' },
+  { value: 'SCOTUS', label: 'Supreme Court' },
+  { value: 'F', label: 'Appeals Courts' },
+  { value: 'FD', label: 'District Courts' },
+  { value: 'FS', label: 'Special Jurisdiction' },
 ];
 
 export const SearchPage: React.FC = () => {
@@ -16,15 +17,19 @@ export const SearchPage: React.FC = () => {
 
   const q = searchParams.get('q') ?? '';
   const courtTypeParam = searchParams.get('court_type') ?? '';
+  const scopeParam = (['title', 'text', 'both'].includes(searchParams.get('scope') ?? '')
+    ? searchParams.get('scope')
+    : 'title') as SearchScope;
   const yearFromParam = searchParams.get('year_from') ?? '';
   const yearToParam = searchParams.get('year_to') ?? '';
   const pageParam = parseInt(searchParams.get('page') ?? '1', 10) || 1;
   const modeParam = (searchParams.get('mode') === 'concept' ? 'concept' : 'keyword') as 'keyword' | 'concept';
 
   const [inputQuery, setInputQuery] = useState(q);
-  const [selectedCourts, setSelectedCourts] = useState<string[]>(
-    courtTypeParam ? courtTypeParam.split(',').filter(Boolean) : []
+  const [selectedCourt, setSelectedCourt] = useState<string>(
+    courtTypeParam ? courtTypeParam.split(',')[0] : ''
   );
+  const [scope, setScope] = useState<SearchScope>(scopeParam);
   const [yearFrom, setYearFrom] = useState(yearFromParam);
   const [yearTo, setYearTo] = useState(yearToParam);
   const [searchMode, setSearchMode] = useState<'keyword' | 'concept'>(modeParam);
@@ -38,11 +43,12 @@ export const SearchPage: React.FC = () => {
   // Sync state with URL query parameters
   useEffect(() => {
     setInputQuery(q);
-    setSelectedCourts(courtTypeParam ? courtTypeParam.split(',').filter(Boolean) : []);
+    setSelectedCourt(courtTypeParam ? courtTypeParam.split(',')[0] : '');
+    setScope(scopeParam);
     setYearFrom(yearFromParam);
     setYearTo(yearToParam);
     setSearchMode(modeParam);
-  }, [q, courtTypeParam, yearFromParam, yearToParam, modeParam]);
+  }, [q, courtTypeParam, scopeParam, yearFromParam, yearToParam, modeParam]);
 
   // Check features (e.g. semantic concept search support)
   useEffect(() => {
@@ -82,6 +88,7 @@ export const SearchPage: React.FC = () => {
     fetchSearch(
       {
         q,
+        scope,
         court_type: courtTypeParam,
         year_from: yearFromParam,
         year_to: yearToParam,
@@ -97,7 +104,7 @@ export const SearchPage: React.FC = () => {
         setError(err.message || "Couldn't reach the server. Try again.");
         setIsLoading(false);
       });
-  }, [q, courtTypeParam, yearFromParam, yearToParam, pageParam, searchMode, semanticSupported]);
+  }, [q, scope, courtTypeParam, yearFromParam, yearToParam, pageParam, searchMode, semanticSupported]);
 
   useEffect(() => {
     loadResults();
@@ -106,7 +113,8 @@ export const SearchPage: React.FC = () => {
   // Update URL search params
   const updateSearchUrl = (updates: {
     q?: string;
-    courts?: string[];
+    court?: string;
+    scope?: SearchScope;
     yearFrom?: string;
     yearTo?: string;
     page?: number;
@@ -119,9 +127,12 @@ export const SearchPage: React.FC = () => {
       params.set('q', newQ.trim());
     }
 
-    const newCourts = updates.courts !== undefined ? updates.courts : selectedCourts;
-    if (newCourts.length > 0) {
-      params.set('court_type', newCourts.join(','));
+    const newScope = updates.scope !== undefined ? updates.scope : scope;
+    params.set('scope', newScope);
+
+    const newCourt = updates.court !== undefined ? updates.court : selectedCourt;
+    if (newCourt) {
+      params.set('court_type', newCourt);
     }
 
     const newYearFrom = updates.yearFrom !== undefined ? updates.yearFrom : yearFrom;
@@ -152,12 +163,14 @@ export const SearchPage: React.FC = () => {
     updateSearchUrl({ q: inputQuery, page: 1 });
   };
 
-  const handleCourtToggle = (code: string) => {
-    const nextCourts = selectedCourts.includes(code)
-      ? selectedCourts.filter((c) => c !== code)
-      : [...selectedCourts, code];
-    setSelectedCourts(nextCourts);
-    updateSearchUrl({ courts: nextCourts, page: 1 });
+  const handleCourtChange = (code: string) => {
+    setSelectedCourt(code);
+    updateSearchUrl({ court: code, page: 1 });
+  };
+
+  const handleScopeChange = (s: SearchScope) => {
+    setScope(s);
+    updateSearchUrl({ scope: s, page: 1 });
   };
 
   const handleApplyYearFilter = () => {
@@ -165,10 +178,10 @@ export const SearchPage: React.FC = () => {
   };
 
   const handleResetFilters = () => {
-    setSelectedCourts([]);
+    setSelectedCourt('');
     setYearFrom('');
     setYearTo('');
-    updateSearchUrl({ courts: [], yearFrom: '', yearTo: '', page: 1 });
+    updateSearchUrl({ court: '', yearFrom: '', yearTo: '', page: 1 });
   };
 
   const handleModeChange = (mode: 'keyword' | 'concept') => {
@@ -228,27 +241,15 @@ export const SearchPage: React.FC = () => {
           {/* Active Filters Row & Concept Switch */}
           <div className="mt-4 pt-3 border-t border-stone-100 dark:border-stone-800 flex flex-wrap items-center justify-between gap-3 text-xs font-interface">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-stone-400 dark:text-stone-500 font-medium mr-1">Courts:</span>
-              {courts.map((c) => {
-                const active = selectedCourts.includes(c.value);
-                return (
-                  <button
-                    key={c.value}
-                    type="button"
-                    onClick={() => handleCourtToggle(c.value)}
-                    className={`px-2.5 py-1 rounded-md text-xs transition-colors cursor-pointer border ${
-                      active
-                        ? 'bg-stone-900 border-stone-900 text-white dark:bg-stone-100 dark:border-stone-100 dark:text-stone-900 font-medium'
-                        : 'bg-stone-50 dark:bg-stone-800 border-stone-200 dark:border-stone-700 text-stone-600 dark:text-stone-300 hover:border-stone-400'
-                    }`}
-                  >
-                    <span>{c.label.replace('U.S. ', '').replace(' Courts', '')}</span>
-                    {c.count !== undefined && (
-                      <span className="ml-1 text-[11px] opacity-70">({c.count})</span>
-                    )}
-                  </button>
-                );
-              })}
+              <span className="text-stone-400 dark:text-stone-500 font-medium mr-1">Court:</span>
+              <CourtSelect
+                courts={courts}
+                value={selectedCourt}
+                onChange={handleCourtChange}
+                className="w-52"
+              />
+              <span className="text-stone-400 dark:text-stone-500 font-medium mr-1 ml-2">Search in:</span>
+              <ScopeSelect value={scope} onChange={handleScopeChange} />
             </div>
 
             {/* Year Inputs and Semantic Concept Switch */}
@@ -302,7 +303,7 @@ export const SearchPage: React.FC = () => {
                   onKeyDown={(e) => e.key === 'Enter' && handleApplyYearFilter()}
                   className="w-18 px-2 py-1 rounded border border-stone-200 dark:border-stone-700 bg-stone-50/50 dark:bg-stone-800/50 text-xs text-stone-900 dark:text-stone-100 font-interface focus:outline-none focus:ring-1 focus:ring-stone-400"
                 />
-                {(selectedCourts.length > 0 || yearFrom || yearTo) && (
+                {(selectedCourt || yearFrom || yearTo) && (
                   <button
                     type="button"
                     onClick={handleResetFilters}
@@ -396,7 +397,7 @@ export const SearchPage: React.FC = () => {
                 Clear all filters
               </button>
               <button
-                onClick={() => updateSearchUrl({ q: '', courts: [], yearFrom: '', yearTo: '', page: 1 })}
+                onClick={() => updateSearchUrl({ q: '', court: '', yearFrom: '', yearTo: '', page: 1 })}
                 className="px-4 py-2 bg-stone-900 dark:bg-stone-100 text-white dark:text-stone-900 text-xs font-medium font-interface rounded-lg transition-colors cursor-pointer"
               >
                 Browse all opinions
@@ -447,7 +448,7 @@ export const SearchPage: React.FC = () => {
                         <>
                           <span aria-hidden="true">·</span>
                           <span className="text-stone-600 dark:text-stone-300">
-                            {c.court_type}
+                            {COURT_TYPE_LABELS[c.court_type] ?? c.court_type}
                           </span>
                         </>
                       )}
