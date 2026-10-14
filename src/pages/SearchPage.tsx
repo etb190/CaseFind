@@ -88,7 +88,7 @@ export const SearchPage: React.FC = () => {
     fetchSearch(
       {
         q,
-        scope,
+        scope: scopeParam,
         court_type: courtTypeParam,
         year_from: yearFromParam,
         year_to: yearToParam,
@@ -104,7 +104,7 @@ export const SearchPage: React.FC = () => {
         setError(err.message || "Couldn't reach the server. Try again.");
         setIsLoading(false);
       });
-  }, [q, scope, courtTypeParam, yearFromParam, yearToParam, pageParam, searchMode, semanticSupported]);
+  }, [q, scopeParam, courtTypeParam, yearFromParam, yearToParam, pageParam, searchMode, semanticSupported]);
 
   useEffect(() => {
     loadResults();
@@ -160,7 +160,11 @@ export const SearchPage: React.FC = () => {
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    updateSearchUrl({ q: inputQuery, page: 1 });
+    if (inputQuery.trim() === q.trim()) {
+      loadResults();
+    } else {
+      updateSearchUrl({ q: inputQuery, page: 1 });
+    }
   };
 
   const handleCourtChange = (code: string) => {
@@ -386,10 +390,26 @@ export const SearchPage: React.FC = () => {
             <h3 className="text-lg font-semibold text-stone-900 dark:text-stone-100 font-interface mb-1">
               No federal court opinions found
             </h3>
-            <p className="text-sm text-stone-500 dark:text-stone-400 max-w-md mx-auto font-interface mb-6">
+            <p className="text-sm text-stone-500 dark:text-stone-400 max-w-md mx-auto font-interface mb-4">
               We couldn&apos;t find any opinions matching your search criteria. Try broadening your keywords or clearing filters.
             </p>
+            {selectedCourt && (
+              <p className="text-xs text-amber-700 dark:text-amber-400 font-interface mb-5 bg-amber-50 dark:bg-amber-950/40 p-2.5 rounded-lg border border-amber-200 dark:border-amber-900/40 max-w-md mx-auto">
+                Filter is active for <strong>{COURT_TYPE_LABELS[selectedCourt] ?? selectedCourt}</strong>. Landmark Supreme Court decisions and other jurisdictions will not appear under this filter.
+              </p>
+            )}
             <div className="flex flex-wrap justify-center gap-3">
+              {selectedCourt && (
+                <button
+                  onClick={() => {
+                    setSelectedCourt('');
+                    updateSearchUrl({ court: '', page: 1 });
+                  }}
+                  className="px-4 py-2 bg-stone-900 dark:bg-stone-100 text-white dark:text-stone-900 text-xs font-medium font-interface rounded-lg transition-colors cursor-pointer"
+                >
+                  Search All Courts
+                </button>
+              )}
               <button
                 onClick={handleResetFilters}
                 className="px-4 py-2 bg-stone-100 dark:bg-stone-800 hover:bg-stone-200 dark:hover:bg-stone-700 text-stone-800 dark:text-stone-200 text-xs font-medium font-interface rounded-lg transition-colors cursor-pointer"

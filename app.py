@@ -62,6 +62,14 @@ def format_citations(raw_citations):
 
 # ---------------- API ENDPOINTS ----------------
 
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, ngrok-skip-browser-warning"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
 @app.route("/api/features")
 def features():
     # Semantic search disabled for now
@@ -128,7 +136,6 @@ def search():
         return jsonify({"total": 0, "page": 1, "page_size": 20, "results": []})
 
     q = request.args.get("q", "").strip()
-    # scope: title = case name (and citations), text = opinion body, both = everything (title matches rank first)
     scope = request.args.get("scope", "title").strip().lower()
     if scope not in ("title", "text", "both"):
         scope = "title"
@@ -143,212 +150,255 @@ def search():
     page_size = 20
 
     conn = get_db()
-    cols = [col[1] for col in conn.execute("PRAGMA table_info(cases)").fetchall()]
-
-    name_col = "name" if "name" in cols else ("case_name" if "case_name" in cols else cols[1])
-    date_col = "date" if "date" in cols else ("date_filed" if "date_filed" in cols else "date")
-    text_col = "text" if "text" in cols else ("plain_text" if "plain_text" in cols else "content")
-    court_col = "court" if "court" in cols else "court_id"
-    cite_col = "citations" if "citations" in cols else None
-    cite_cnt_col = "citation_count" if "citation_count" in cols else None
-    ctype_col = "court_type" if "court_type" in cols else None
-
-    conditions = []
-    params = []
-
-    # Detect FTS5 index and which columns it actually has
-    has_fts = False
-    fts_cols = []
-    fts_text_idx = 3
     try:
-        fts_row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cases_fts'").fetchone()
-        if fts_row:
-            fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(cases_fts)").fetchall()]
-            has_fts = bool(fts_cols)
-            if "text" in fts_cols:
-                fts_text_idx = fts_cols.index("text")
-    except Exception:
+        cols = [col[1] for col in conn.execute("PRAGMA table_info(cases)").fetchall()]
+        name_col = "name" if "name" in cols else ("case_name" if "case_name" in cols else cols[1])
+        full_name_col = "case_name_full" if "case_name_full" in cols else None
+        date_col = "date" if "date" in cols else ("date_filed" if "date_filed" in cols else "date")
+        text_col = "text" if "text" in cols else ("plain_text" if "plain_text" in cols else "content")
+        court_col = "court" if "court" in cols else "court_id"
+        cite_col = "citations" if "citations" in cols else None
+        cite_cnt_col = "citation_count" if "citation_count" in cols else None
+        ctype_col = "court_type" if "court_type" in cols else None
+
+        # Detect FTS5 index and verify it contains rows
         has_fts = False
-    fts_has_name = "name" in fts_cols
-    fts_has_text = "text" in fts_cols
-
-    fts_query = None
-    words = []
-    if q:
-        clean_q = re.sub(r'[^a-zA-Z0-9\s"]', ' ', q).strip()
-        words = [w for w in clean_q.split() if w]
-
-        if has_fts and words:
-            if scope == "title" and fts_has_name:
-                fts_query = build_fts_query(words, "name")
-            elif scope == "text" and fts_has_text:
-                fts_query = build_fts_query(words, "text")
-            elif scope == "both":
-                fts_query = build_fts_query(words, None)
-
-        if fts_query:
-            if scope == "title":
-                # Case name via FTS; also match the raw citation string (citations are not in the FTS index)
-                cite_cond = f" OR {cite_col} LIKE ?" if cite_col else ""
-                conditions.append(f"(rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?){cite_cond})")
-                params.append(fts_query)
-                if cite_col:
-                    params.append(f"%{q}%")
-            elif scope == "text":
-                conditions.append("rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?)")
-                params.append(fts_query)
-            else:  # both
-                cite_cond = f" OR {cite_col} LIKE ?" if cite_col else ""
-                conditions.append(f"(rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?){cite_cond})")
-                params.append(fts_query)
-                if cite_col:
-                    params.append(f"%{q}%")
-        else:
-            # LIKE fallback (no usable FTS index)
-            if scope == "title":
-                cond = f"{name_col} LIKE ?"
-                params.append(f"%{q}%")
-                if cite_col:
-                    cond += f" OR {cite_col} LIKE ?"
-                    params.append(f"%{q}%")
-                conditions.append(f"({cond})")
-            elif scope == "text":
-                conditions.append(f"{text_col} LIKE ?")
-                params.append(f"%{q}%")
-            else:
-                cond = f"{name_col} LIKE ? OR {text_col} LIKE ?"
-                params.extend([f"%{q}%", f"%{q}%"])
-                if cite_col:
-                    cond += f" OR {cite_col} LIKE ?"
-                    params.append(f"%{q}%")
-                conditions.append(f"({cond})")
-
-    # Court type filter (single value or comma-separated, e.g. SCOTUS or F,FD)
-    court_filter = [c.strip().upper() for c in court_type.split(",") if c.strip()]
-    if court_filter:
-        or_parts = []
-        if ctype_col:
-            appellate_tuple = "','".join(["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"])
-            special_tuple = "'ccpa', 'cusx', 'cit', 'cofc', 'armfor', 'cavc', 'tax'"
-            for ct in court_filter:
-                if ct == "SCOTUS":
-                    or_parts.append(f"(UPPER({ctype_col}) = 'SCOTUS' OR LOWER({court_col}) = 'scotus')")
-                elif ct == "F":
-                    or_parts.append(f"(UPPER({ctype_col}) = 'F' AND LOWER({court_col}) IN ('{appellate_tuple}'))")
-                elif ct == "FD":
-                    or_parts.append(f"(UPPER({ctype_col}) = 'FD' OR (UPPER({ctype_col}) = 'F' AND LOWER({court_col}) NOT IN ('scotus', '{appellate_tuple}', {special_tuple})))")
-                elif ct == "FS":
-                    or_parts.append(f"(UPPER({ctype_col}) = 'FS' OR LOWER({court_col}) IN ({special_tuple}))")
-                else:
-                    or_parts.append(f"UPPER({ctype_col}) = ?")
-                    params.append(ct)
-        else:
-            # Legacy DB without court_type column: derive from court id
-            appellate_ids = ",".join([f"'{c}'" for c in ["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"]])
-            for ct in court_filter:
-                if ct == "SCOTUS":
-                    or_parts.append(f"LOWER({court_col}) = 'scotus'")
-                elif ct == "F":
-                    or_parts.append(f"LOWER({court_col}) IN ({appellate_ids})")
-                elif ct == "FB":
-                    or_parts.append(f"(LOWER({court_col}) LIKE '%bankr%' OR SUBSTR(LOWER({court_col}), -1) = 'b')")
-                else:
-                    or_parts.append("1=0")
-        conditions.append("(" + " OR ".join(or_parts) + ")")
-
-    # Bankruptcy cases are excluded from all results
-    if ctype_col:
-        conditions.append(f"UPPER(COALESCE({ctype_col}, '')) <> 'FB'")
-
-    if year_from:
-        conditions.append(f"SUBSTR({date_col}, 1, 4) >= ?")
-        params.append(year_from)
-
-    if year_to:
-        conditions.append(f"SUBSTR({date_col}, 1, 4) <= ?")
-        params.append(year_to)
-
-    where_sql = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-
-    # Total count
-    count_query = f"SELECT COUNT(*) as total FROM cases {where_sql}"
-    total = conn.execute(count_query, params).fetchone()["total"]
-
-    # Title matches rank first when searching everything; otherwise newest first
-    rank_sql = ""
-    rank_params = []
-    if q and scope == "both":
-        rank_sql = f"CASE WHEN {name_col} LIKE ? THEN 0 ELSE 1 END, "
-        rank_params.append(f"%{q}%")
-
-    offset = (page - 1) * page_size
-    select_cols = [f"id, {name_col} as case_name, {court_col} as court, {date_col} as date_filed"]
-    if ctype_col:
-        select_cols.append(f"{ctype_col} as court_type")
-    if cite_col:
-        select_cols.append(f"{cite_col} as citations")
-    if cite_cnt_col:
-        select_cols.append(f"{cite_cnt_col} as citation_count")
-
-    select_query = f"""
-        SELECT {', '.join(select_cols)}
-        FROM cases {where_sql}
-        ORDER BY {rank_sql}{date_col} DESC
-        LIMIT ? OFFSET ?
-    """
-    rows = conn.execute(select_query, params + rank_params + [page_size, offset]).fetchall()
-
-    # Text snippets for text/both scopes (FTS only): show the matched passage
-    snippets = {}
-    if rows and q and scope in ("text", "both") and has_fts and fts_has_text and fts_query:
+        fts_cols = []
+        fts_text_idx = 3
         try:
-            ids = [r["id"] for r in rows]
-            id_placeholders = ",".join(["?"] * len(ids))
-            snip_rows = conn.execute(
-                f"""SELECT c.id as cid, snippet(cases_fts, {fts_text_idx}, '', '', '…', 24) as snip
-                    FROM cases_fts
-                    JOIN cases c ON c.rowid = cases_fts.rowid
-                    WHERE cases_fts MATCH ? AND c.id IN ({id_placeholders})""",
-                [fts_query] + ids,
-            ).fetchall()
-            for sr in snip_rows:
-                snippets[sr["cid"]] = re.sub(r"\s+", " ", sr["snip"]).strip()
+            fts_row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cases_fts'").fetchone()
+            if fts_row:
+                fts_cols = [r[1] for r in conn.execute("PRAGMA table_info(cases_fts)").fetchall()]
+                # Verify that cases_fts has index data by testing a probe query
+                probe = conn.execute("SELECT 1 FROM cases_fts LIMIT 1").fetchone()
+                has_fts = bool(fts_cols) and (probe is not None)
+                if "text" in fts_cols:
+                    fts_text_idx = fts_cols.index("text")
         except Exception:
-            snippets = {}
+            has_fts = False
 
-    conn.close()
+        fts_has_name = "name" in fts_cols
+        fts_has_text = "text" in fts_cols
 
-    results = []
-    for r in rows:
-        court_str = r["court"]
-        stored_type = r["court_type"] if (ctype_col and "court_type" in r.keys()) else None
-        if stored_type:
-            stored_type = str(stored_type).upper()
-            if stored_type == "F" and (court_str or "").lower() == "scotus":
-                stored_type = "SCOTUS"
-        c_type = stored_type or map_court_type(court_str)
-        raw_cites = r["citations"] if cite_col else []
-        cites = format_citations(raw_cites)
+        def build_conditions(use_fts=True):
+            conds = []
+            c_params = []
+            f_query = None
 
-        item = {
-            "id": r["id"],
-            "case_name": r["case_name"] or "Unknown Case",
-            "court": court_str or "Federal Court",
-            "court_type": c_type,
-            "date_filed": str(r["date_filed"] or "")[:10],
-            "citations": cites,
-            "citation_count": r["citation_count"] if cite_cnt_col else 0
-        }
-        if r["id"] in snippets:
-            item["snippet"] = snippets[r["id"]]
-        results.append(item)
+            if q:
+                clean_q = re.sub(r'[^a-zA-Z0-9\s"]', ' ', q).strip()
+                words = [w for w in clean_q.split() if w]
+                if use_fts and has_fts and words:
+                    if scope == "title" and fts_has_name:
+                        f_query = build_fts_query(words, "name")
+                    elif scope == "text" and fts_has_text:
+                        f_query = build_fts_query(words, "text")
+                    elif scope == "both":
+                        f_query = build_fts_query(words, None)
 
-    return jsonify({
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "results": results
-    })
+                if f_query:
+                    cite_cond = f" OR {cite_col} LIKE ?" if cite_col else ""
+                    if scope == "text":
+                        conds.append("rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?)")
+                        c_params.append(f_query)
+                    else:
+                        conds.append(f"(rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?){cite_cond})")
+                        c_params.append(f_query)
+                        if cite_col:
+                            c_params.append(f"%{q}%")
+                else:
+                    # LIKE fallback
+                    if scope in ("title", "both") and words:
+                        # Match significant words across name and case_name_full
+                        significant = [w for w in words if w.lower() not in ("v", "vs", "versus")] or words
+                        title_clauses = []
+                        for w in significant:
+                            if full_name_col:
+                                title_clauses.append(f"({name_col} LIKE ? OR {full_name_col} LIKE ?)")
+                                c_params.extend([f"%{w}%", f"%{w}%"])
+                            else:
+                                title_clauses.append(f"{name_col} LIKE ?")
+                                c_params.append(f"%{w}%")
+                        name_match = " AND ".join(title_clauses)
+                        if scope == "both" and text_col:
+                            cond = f"(({name_match}) OR {text_col} LIKE ?)"
+                            c_params.append(f"%{q}%")
+                        else:
+                            cond = f"({name_match})"
+                        if cite_col:
+                            cond = f"({cond} OR {cite_col} LIKE ?)"
+                            c_params.append(f"%{q}%")
+                        conds.append(cond)
+                    elif scope == "text":
+                        conds.append(f"{text_col} LIKE ?")
+                        c_params.append(f"%{q}%")
+                    else:
+                        cond = f"{name_col} LIKE ?"
+                        c_params.append(f"%{q}%")
+                        if cite_col:
+                            cond += f" OR {cite_col} LIKE ?"
+                            c_params.append(f"%{q}%")
+                        conds.append(f"({cond})")
+
+            # Court type filter
+            court_filter = [c.strip().upper() for c in court_type.split(",") if c.strip()]
+            if court_filter:
+                or_parts = []
+                if ctype_col:
+                    appellate_tuple = "','".join(["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"])
+                    special_tuple = "'ccpa', 'cusx', 'cit', 'cofc', 'armfor', 'cavc', 'tax'"
+                    for ct in court_filter:
+                        if ct == "SCOTUS":
+                            or_parts.append(f"(UPPER({ctype_col}) = 'SCOTUS' OR LOWER({court_col}) = 'scotus')")
+                        elif ct == "F":
+                            or_parts.append(f"(UPPER({ctype_col}) = 'F' AND LOWER({court_col}) IN ('{appellate_tuple}'))")
+                        elif ct == "FD":
+                            or_parts.append(f"(UPPER({ctype_col}) = 'FD' OR (UPPER({ctype_col}) = 'F' AND LOWER({court_col}) NOT IN ('scotus', '{appellate_tuple}', {special_tuple})))")
+                        elif ct == "FS":
+                            or_parts.append(f"(UPPER({ctype_col}) = 'FS' OR LOWER({court_col}) IN ({special_tuple}))")
+                        else:
+                            or_parts.append(f"UPPER({ctype_col}) = ?")
+                            c_params.append(ct)
+                else:
+                    appellate_ids = ",".join([f"'{c}'" for c in ["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"]])
+                    for ct in court_filter:
+                        if ct == "SCOTUS":
+                            or_parts.append(f"LOWER({court_col}) = 'scotus'")
+                        elif ct == "F":
+                            or_parts.append(f"LOWER({court_col}) IN ({appellate_ids})")
+                        elif ct == "FB":
+                            or_parts.append(f"(LOWER({court_col}) LIKE '%bankr%' OR SUBSTR(LOWER({court_col}), -1) = 'b')")
+                        else:
+                            or_parts.append("1=0")
+                conds.append("(" + " OR ".join(or_parts) + ")")
+
+            if ctype_col:
+                conds.append(f"UPPER(COALESCE({ctype_col}, '')) <> 'FB'")
+            if year_from:
+                conds.append(f"SUBSTR({date_col}, 1, 4) >= ?")
+                c_params.append(year_from)
+            if year_to:
+                conds.append(f"SUBSTR({date_col}, 1, 4) <= ?")
+                c_params.append(year_to)
+
+            return conds, c_params, f_query
+
+        # Execute with FTS first; if FTS fails or yields 0 rows for query, fallback to LIKE
+        use_fts_mode = has_fts and bool(q)
+        conditions, params, fts_query = build_conditions(use_fts=use_fts_mode)
+        where_sql = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        count_query = f"SELECT COUNT(*) as total FROM cases {where_sql}"
+
+        total = 0
+        try:
+            total = conn.execute(count_query, params).fetchone()["total"]
+        except Exception:
+            # FTS execution error (e.g. malformed FTS syntax) - fallback to LIKE
+            use_fts_mode = False
+            conditions, params, fts_query = build_conditions(use_fts=False)
+            where_sql = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+            count_query = f"SELECT COUNT(*) as total FROM cases {where_sql}"
+            total = conn.execute(count_query, params).fetchone()["total"]
+
+        # If FTS matched 0 cases for a non-empty keyword/title search, attempt LIKE fallback
+        if total == 0 and q and use_fts_mode:
+            fallback_conds, fallback_params, _ = build_conditions(use_fts=False)
+            fallback_where = ("WHERE " + " AND ".join(fallback_conds)) if fallback_conds else ""
+            fallback_count_query = f"SELECT COUNT(*) as total FROM cases {fallback_where}"
+            try:
+                fb_total = conn.execute(fallback_count_query, fallback_params).fetchone()["total"]
+                if fb_total > 0:
+                    total = fb_total
+                    conditions = fallback_conds
+                    params = fallback_params
+                    where_sql = fallback_where
+                    fts_query = None
+                    use_fts_mode = False
+            except Exception:
+                pass
+
+        rank_sql = ""
+        rank_params = []
+        if q and scope == "both":
+            rank_sql = f"CASE WHEN {name_col} LIKE ? THEN 0 ELSE 1 END, "
+            rank_params.append(f"%{q}%")
+
+        offset = (page - 1) * page_size
+        select_cols = [f"id, {name_col} as case_name, {court_col} as court, {date_col} as date_filed"]
+        if ctype_col:
+            select_cols.append(f"{ctype_col} as court_type")
+        if cite_col:
+            select_cols.append(f"{cite_col} as citations")
+        if cite_cnt_col:
+            select_cols.append(f"{cite_cnt_col} as citation_count")
+
+        select_query = f"""
+            SELECT {', '.join(select_cols)}
+            FROM cases {where_sql}
+            ORDER BY {rank_sql}{date_col} DESC
+            LIMIT ? OFFSET ?
+        """
+        rows = conn.execute(select_query, params + rank_params + [page_size, offset]).fetchall()
+
+        snippets = {}
+        if rows and q and scope in ("text", "both") and use_fts_mode and fts_has_text and fts_query:
+            try:
+                ids = [r["id"] for r in rows]
+                id_placeholders = ",".join(["?"] * len(ids))
+                snip_rows = conn.execute(
+                    f"""SELECT c.id as cid, snippet(cases_fts, {fts_text_idx}, '', '', '…', 24) as snip
+                        FROM cases_fts
+                        JOIN cases c ON c.rowid = cases_fts.rowid
+                        WHERE cases_fts MATCH ? AND c.id IN ({id_placeholders})""",
+                    [fts_query] + ids,
+                ).fetchall()
+                for sr in snip_rows:
+                    snippets[sr["cid"]] = re.sub(r"\s+", " ", sr["snip"]).strip()
+            except Exception:
+                snippets = {}
+
+        results = []
+        for r in rows:
+            court_str = r["court"]
+            stored_type = r["court_type"] if (ctype_col and "court_type" in r.keys()) else None
+            if stored_type:
+                stored_type = str(stored_type).upper()
+                if stored_type == "F" and (court_str or "").lower() == "scotus":
+                    stored_type = "SCOTUS"
+            c_type = stored_type or map_court_type(court_str)
+            raw_cites = r["citations"] if cite_col else []
+            cites = format_citations(raw_cites)
+            item = {
+                "id": r["id"],
+                "case_name": r["case_name"] or "Unknown Case",
+                "court": court_str or "Federal Court",
+                "court_type": c_type,
+                "date_filed": str(r["date_filed"] or "")[:10],
+                "citations": cites,
+                "citation_count": r["citation_count"] if cite_cnt_col else 0
+            }
+            if r["id"] in snippets:
+                item["snippet"] = snippets[r["id"]]
+            results.append(item)
+
+        return jsonify({
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "results": results
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            "error": f"Database query error: {str(e)}",
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "results": []
+        }), 500
+    finally:
+        conn.close()
 
 @app.route("/api/case/<path:case_id>")
 def get_case(case_id):
