@@ -59,12 +59,15 @@ def init_db(db_path, clear=False):
     )
     """)
 
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA busy_timeout=30000")
+    cur.execute("PRAGMA synchronous=NORMAL")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cases_court ON cases(court)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cases_date ON cases(date_filed)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_cases_court_type ON cases(court_type)")
     conn.commit()
     conn.close()
-    print(f"[database] Schema initialized at {db_path}")
+    print(f"[database] Schema initialized at {db_path} (WAL mode enabled)")
 
 def stream_csv(name, date_str):
     url = f"{BULK_BASE}{name}-{date_str}.csv.bz2"
@@ -101,15 +104,15 @@ def clean_text(raw_row):
         t = html.unescape(re.sub(r"<[^>]+>", " ", html_content))
     return re.sub(r"\s+", " ", t).strip()
 
-def map_court_category(court_id, jurisdiction="F"):
+def map_court_category(court_id, jurisdiction=""):
     cid = (court_id or "").lower()
     if cid == "scotus":
         return "SCOTUS"
-    if cid in FEDERAL_APPELLATE or jurisdiction == "F":
+    if cid in FEDERAL_APPELLATE:
         return "F"
     elif "bankr" in cid or "bap" in cid or jurisdiction == "FB":
         return "FB"
-    elif any(k in cid for k in ["claim", "trade", "tax"]) or jurisdiction == "FS":
+    elif any(k in cid for k in ["claim", "trade", "tax", "cit", "armfor", "cavc"]) or jurisdiction == "FS":
         return "FS"
     return "FD"
 
@@ -118,18 +121,7 @@ def is_bankruptcy_court(court_id, jurisdiction=""):
     cid = (court_id or "").lower()
     return jurisdiction == "FB" or "bankr" in cid or "bap" in cid or (len(cid) >= 3 and cid.endswith("b") and cid not in ("scotus", "cabc"))
 
-def build_fts(cur, conn):
-    """Build/refresh the external-content FTS5 index over the cases table."""
-    print("\n[search] Building SQLite FTS5 full-text search index for sub-millisecond search...")
-    try:
-        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS cases_fts USING fts5(id, name, court, text, content='cases', content_rowid='rowid')")
-        cur.execute("INSERT INTO cases_fts(cases_fts) VALUES('rebuild')")
-        conn.commit()
-        print("[search] FTS5 full-text index built successfully.")
-    except Exception as e:
-        print(f"[search] Note: FTS5 indexing skipped: {e}")
-
-def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_districts=True, include_bankruptcy=False, court_filter=None, resume=False, skip_fts=False):
+def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_districts=True, include_bankruptcy=False, court_filter=None, resume=False):
     ensure_lbzip2()
     
     # If resuming, do not clear the database
@@ -166,12 +158,17 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
             import pickle
             with open(cache_path, "rb") as f:
                 cached = pickle.load(f)
-            # v2 format: {"v": 2, "_dump_date": ..., "clusters": {id: (court, name, date, ...)}}
-            # v1/legacy caches are ignored (cannot validate provenance or dedup state)
-            if isinstance(cached, dict) and cached.get("v") == 2 and cached.get("_dump_date") == date_str:
+            # New format: {"_dump_date": ..., "clusters": {id: (court, name, date, ...)}}
+            # Legacy format: plain {id: tuple} - ignored (cannot validate dump date)
+            if isinstance(cached, dict) and cached.get("_dump_date") == date_str:
                 rows = cached.get("clusters", {})
                 for k, v in rows.items():
-                    if isinstance(v, (list, tuple)) and len(v) >= 3:
+                    if isinstance(v, dict):
+                        court = v.get("court", "")
+                        if court_filter and str(court).lower() != court_filter:
+                            continue
+                        clusters[str(k)] = v
+                    elif isinstance(v, (list, tuple)) and len(v) >= 3:
                         if court_filter and str(v[0]).lower() != court_filter:
                             continue
                         clusters[str(k)] = {
@@ -185,7 +182,7 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
                 print(f"[clusters] Loaded {len(clusters):,} clusters from {cache_path}, dump {date_str}{label} (skipped scan!)")
                 break
             else:
-                print(f"[clusters] {cache_path} ignored (wrong version/stale/legacy or different dump date) - rescanning")
+                print(f"[clusters] {cache_path} ignored (stale/legacy format or different dump date) - rescanning")
         except Exception as e:
             print(f"[clusters] Note on {cache_path} cache: {e}")
 
@@ -225,30 +222,6 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
         p.kill()
         print(f"[dockets] Found {len(federal_dockets):,} federal dockets in {time.time()-t_dock:.1f}s")
 
-        # 2b. Verification pass: the bulk export contains duplicate docket rows
-        # (same docket id appearing under different courts - observed live: 589K
-        # 'scotus' rows where only ~65K are real). Drop dockets whose id also
-        # appears under a conflicting court, so bankruptcy/state rows cannot
-        # leak in through a duplicate row. With --court this requires strict
-        # agreement; for full-federal it only drops bankruptcy conflicts.
-        if federal_dockets and (court_filter or not include_bankruptcy):
-            t_ver = time.time()
-            rd, p = stream_csv("dockets", date_str)
-            dropped = 0
-            for r in rd:
-                did = r.get("id")
-                claimed = federal_dockets.get(did)
-                if claimed is None:
-                    continue
-                rc = r.get("court_id", "")
-                if rc == claimed:
-                    continue
-                if court_filter or is_bankruptcy_court(rc):
-                    del federal_dockets[did]
-                    dropped += 1
-            p.kill()
-            print(f"[dockets] Verification pass: dropped {dropped:,} conflicting dockets in {time.time()-t_ver:.1f}s -> {len(federal_dockets):,} clean dockets")
-
         # 3. Opinion Clusters (case names, dates, citations)
         t_clus = time.time()
         rd, p = stream_csv("opinion-clusters", date_str)
@@ -272,7 +245,7 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
         try:
             import pickle
             with open(cache_file, "wb") as f:
-                pickle.dump({"v": 2, "_dump_date": date_str, "clusters": clusters}, f, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump({"_dump_date": date_str, "clusters": clusters}, f, protocol=pickle.HIGHEST_PROTOCOL)
             scope = "full federal" if not court_filter else f"court={court_filter}"
             print(f"[clusters] Cached {len(clusters):,} clusters ({scope}) to {cache_file} (dump {date_str})")
         except Exception as e:
@@ -284,6 +257,7 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
 
     batch = []
     saved_count = 0
+    skipped_existing = 0
     BATCH_SIZE = 2000
 
     print(f"[opinions] Ingesting opinions into SQLite ({DB_PATH})...", flush=True)
@@ -293,6 +267,9 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
         if clus_id in clusters:
             case_id = str(r.get("id") or clus_id)
             if case_id in existing_ids:
+                skipped_existing += 1
+                if i > 0 and i % 50_000 == 0 and len(batch) == 0:
+                    print(f"  [opinions scan] {i:,} rows scanned | {skipped_existing:,} skipped (already in DB) | {saved_count:,} new cases retained", flush=True)
                 continue
 
             text = clean_text(r)
@@ -326,14 +303,14 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
                     batch = []
 
                     rate = saved_count / max(1, (time.time() - t_ops))
-                    print(f"  [saved] {saved_count:,} cases saved | scanned {i:,} rows ({rate:.0f} cases/s)", flush=True)
+                    print(f"  [saved] {saved_count:,} new cases saved | scanned {i:,} rows ({rate:.0f} cases/s)", flush=True)
 
                     if target_count and saved_count >= target_count:
                         print(f"[target] Reached requested limit of {target_count:,} cases.")
                         break
 
         if i > 0 and i % 50_000 == 0 and len(batch) == 0:
-            print(f"  [opinions scan] {i:,} rows scanned | {saved_count:,} federal cases retained", flush=True)
+            print(f"  [opinions scan] {i:,} rows scanned | {skipped_existing:,} skipped (already in DB) | {saved_count:,} new cases retained", flush=True)
 
     if batch:
         cur.executemany("""
@@ -348,20 +325,64 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
     p.kill()
 
     # 5. Build SQLite FTS5 Full-Text Search Table for fast searching
-    if skip_fts:
-        print("\n[search] Skipping FTS build (--skip-fts). Build it later with: python3 ingest_cases.py --fts-only")
-    else:
-        build_fts(cur, conn)
+    build_fts(DB_PATH)
 
     conn.close()
 
     total_time = (time.time() - t0) / 60
     db_size_mb = os.path.getsize(DB_PATH) / (1024 * 1024)
     print("\n" + "=" * 60)
-    print(f"  COMPLETE: {saved_count:,} federal cases ingested")
+    print(f"  COMPLETE: {saved_count:,} new federal cases ingested ({len(existing_ids) + saved_count:,} total)")
     print(f"  Database size: {db_size_mb:.1f} MB ({DB_PATH})")
     print(f"  Total time: {total_time:.1f} minutes")
     print("=" * 60 + "\n")
+
+def build_fts(db_path=DB_PATH):
+    print(f"\n[search] Building SQLite FTS5 full-text search index in {db_path}...")
+    t0 = time.time()
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS cases_fts USING fts5(id, name, court, text, content='cases', content_rowid='rowid')")
+        cur.execute("INSERT INTO cases_fts(cases_fts) VALUES('rebuild')")
+        conn.commit()
+        conn.close()
+        print(f"[search] FTS5 full-text index built successfully in {time.time()-t0:.1f}s.")
+    except Exception as e:
+        print(f"[search] Note: FTS5 indexing error: {e}")
+
+def fix_court_types(db_path=DB_PATH):
+    print(f"\n[maintenance] Repairing court_type values in {db_path}...")
+    t0 = time.time()
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA busy_timeout=30000")
+
+    appellate_list = "','".join(FEDERAL_APPELLATE)
+    special_list = "'ccpa','cusx','cit','cofc','armfor','cavc','tax'"
+
+    # 1. SCOTUS
+    cur.execute("UPDATE cases SET court_type = 'SCOTUS' WHERE LOWER(court) = 'scotus'")
+    # 2. Appellate Courts
+    cur.execute(f"UPDATE cases SET court_type = 'F' WHERE LOWER(court) IN ('{appellate_list}') AND LOWER(court) != 'scotus'")
+    # 3. Special Courts
+    cur.execute(f"UPDATE cases SET court_type = 'FS' WHERE LOWER(court) IN ({special_list})")
+    # 4. District Courts (everything federal that is not SCOTUS, Appellate, Special, or Bankruptcy)
+    cur.execute(f"""
+        UPDATE cases SET court_type = 'FD' 
+        WHERE LOWER(court) NOT IN ('scotus', '{appellate_list}', {special_list})
+          AND LOWER(court) NOT LIKE '%bankr%'
+          AND LOWER(court) NOT LIKE '%bap%'
+          AND (court_type IS NULL OR court_type = 'F' OR court_type = '')
+    """)
+    conn.commit()
+
+    print(f"[maintenance] Repaired court_type distribution in {time.time()-t0:.1f}s:")
+    for ct, cnt in cur.execute("SELECT court_type, COUNT(*) FROM cases GROUP BY court_type ORDER BY COUNT(*) DESC").fetchall():
+        print(f"  {ct or 'NULL'}: {cnt:,} cases")
+    conn.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest federal cases into CaseFind SQLite database")
@@ -371,15 +392,19 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume ingestion without clearing previously saved cases")
     parser.add_argument("--appeals-only", action="store_true", help="Ingest only Supreme Court and Circuit Appeals")
     parser.add_argument("--include-bankruptcy", action="store_true", help="Also ingest bankruptcy courts (excluded by default)")
-    parser.add_argument("--skip-fts", action="store_true", help="Skip FTS5 index build (saves disk and time; build later with --fts-only)")
-    parser.add_argument("--fts-only", action="store_true", help="Only (re)build the FTS5 index on the existing database, then exit")
     parser.add_argument("--court", type=str, default=None, help="Restrict ingestion to one court id (e.g. scotus, ca9, nyed)")
+    parser.add_argument("--fix-court-types", action="store_true", help="Repair district court_type flags in existing database")
+    parser.add_argument("--build-fts", action="store_true", help="Build or rebuild FTS5 full-text search table on current database")
     args = parser.parse_args()
 
-    if args.fts_only:
-        conn = sqlite3.connect(DB_PATH)
-        build_fts(conn.cursor(), conn)
-        conn.close()
+    if args.fix_court_types:
+        fix_court_types(DB_PATH)
+        if args.build_fts:
+            build_fts(DB_PATH)
+        sys.exit(0)
+
+    if args.build_fts:
+        build_fts(DB_PATH)
         sys.exit(0)
 
     run_ingest(
@@ -389,6 +414,5 @@ if __name__ == "__main__":
         include_districts=not args.appeals_only,
         include_bankruptcy=args.include_bankruptcy,
         court_filter=(args.court.lower() if args.court else None),
-        resume=(args.resume or args.keep_existing),
-        skip_fts=args.skip_fts
+        resume=(args.resume or args.keep_existing)
     )

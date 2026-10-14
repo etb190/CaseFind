@@ -16,7 +16,12 @@ default_db = os.path.expanduser("~/cases.db") if os.path.exists(os.path.expandus
 DB_PATH = os.environ.get("DB_PATH", default_db)
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -91,6 +96,21 @@ def get_courts():
         court_counts["F"] = max(0, base.get("F", 0) - scotus_legacy)
         court_counts["FD"] = base.get("FD", 0)
         court_counts["FS"] = base.get("FS", 0)
+
+        # Fallback for databases where district courts were stored under 'F'
+        if court_counts["FD"] == 0 and court_counts["F"] > 0:
+            appellate_list = "','".join(["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"])
+            special_list = "'ccpa', 'cusx', 'cit', 'cofc', 'armfor', 'cavc', 'tax'"
+            # Count SCOTUS and appeals using indexes
+            actual_appeals = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE LOWER({court_col}) IN ('{appellate_list}')").fetchone()["c"]
+            actual_scotus = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE LOWER({court_col}) = 'scotus'").fetchone()["c"]
+            actual_special = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE LOWER({court_col}) IN ({special_list})").fetchone()["c"]
+            total_cases = conn.execute("SELECT COUNT(*) as c FROM cases").fetchone()["c"]
+
+            court_counts["SCOTUS"] = actual_scotus
+            court_counts["F"] = actual_appeals
+            court_counts["FS"] = actual_special
+            court_counts["FD"] = max(0, total_cases - (actual_scotus + actual_appeals + actual_special))
     else:
         rows = conn.execute(f"SELECT {court_col} as court, COUNT(*) as cnt FROM cases GROUP BY {court_col}").fetchall()
         for r in rows:
@@ -208,11 +228,17 @@ def search():
     if court_filter:
         or_parts = []
         if ctype_col:
+            appellate_tuple = "','".join(["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"])
+            special_tuple = "'ccpa', 'cusx', 'cit', 'cofc', 'armfor', 'cavc', 'tax'"
             for ct in court_filter:
                 if ct == "SCOTUS":
                     or_parts.append(f"(UPPER({ctype_col}) = 'SCOTUS' OR LOWER({court_col}) = 'scotus')")
                 elif ct == "F":
-                    or_parts.append(f"(UPPER({ctype_col}) = 'F' AND LOWER({court_col}) <> 'scotus')")
+                    or_parts.append(f"(UPPER({ctype_col}) = 'F' AND LOWER({court_col}) IN ('{appellate_tuple}'))")
+                elif ct == "FD":
+                    or_parts.append(f"(UPPER({ctype_col}) = 'FD' OR (UPPER({ctype_col}) = 'F' AND LOWER({court_col}) NOT IN ('scotus', '{appellate_tuple}', {special_tuple})))")
+                elif ct == "FS":
+                    or_parts.append(f"(UPPER({ctype_col}) = 'FS' OR LOWER({court_col}) IN ({special_tuple}))")
                 else:
                     or_parts.append(f"UPPER({ctype_col}) = ?")
                     params.append(ct)
