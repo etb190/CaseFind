@@ -16,10 +16,13 @@ default_db = os.path.expanduser("~/cases.db") if os.path.exists(os.path.expandus
 DB_PATH = os.environ.get("DB_PATH", default_db)
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=60)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-64000")
+        conn.execute("PRAGMA mmap_size=268435456")
     except Exception:
         pass
     conn.row_factory = sqlite3.Row
@@ -38,9 +41,10 @@ def map_court_type(court_str):
     return "FD"
 
 def build_fts_query(words, column=None):
-    """Build an FTS5 MATCH expression; all words are ANDed together as quoted phrases.
-    Optionally restrict matches to a single FTS column (e.g. 'name' or 'text')."""
-    safe = [w.replace('"', " ").strip() for w in words if w.strip()]
+    """Build an FTS5 MATCH expression; filter single-letter connectors and stopwords."""
+    stop = {"v", "vs", "versus", "in", "re", "and", "the", "of", "et", "al"}
+    meaningful = [w for w in words if w.lower() not in stop and len(w) > 1] or words
+    safe = [w.replace('"', " ").strip() for w in meaningful if w.strip()]
     if not safe:
         return None
     if column:
@@ -196,16 +200,20 @@ def search():
                     elif scope == "both":
                         f_query = build_fts_query(words, None)
 
+                is_citation = any(ch.isdigit() for ch in q)
                 if f_query:
-                    cite_cond = f" OR {cite_col} LIKE ?" if cite_col else ""
                     if scope == "text":
                         conds.append("rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?)")
                         c_params.append(f_query)
-                    else:
-                        conds.append(f"(rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?){cite_cond})")
+                    elif is_citation and cite_col:
+                        # Only search citations when query contains numbers (e.g. 384 U.S. 436)
+                        conds.append(f"(rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?) OR {cite_col} LIKE ?)")
                         c_params.append(f_query)
-                        if cite_col:
-                            c_params.append(f"%{q}%")
+                        c_params.append(f"%{q}%")
+                    else:
+                        # Pure fast index lookup (sub-millisecond)
+                        conds.append("rowid IN (SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?)")
+                        c_params.append(f_query)
                 else:
                     # LIKE fallback
                     if scope in ("title", "both") and words:

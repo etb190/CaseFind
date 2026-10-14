@@ -15,7 +15,7 @@ const DEFAULT_HEADERS: Record<string, string> = {
   "Accept": "application/json",
   "ngrok-skip-browser-warning": "true",
 };
-const FETCH_TIMEOUT_MS = 15000;
+const FETCH_TIMEOUT_MS = 60000;
 
 function buildSearchParams(params: SearchQueryParams): string {
   const searchParams = new URLSearchParams();
