@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import threading
 import sqlite3
 import json
 import re
@@ -22,8 +23,8 @@ def get_db():
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=60000")
         conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA cache_size=-64000")
-        conn.execute("PRAGMA mmap_size=268435456")
+        conn.execute("PRAGMA cache_size=-131072")
+        conn.execute("PRAGMA mmap_size=1073741824")
     except Exception:
         pass
     conn.row_factory = sqlite3.Row
@@ -108,28 +109,86 @@ def features():
 
 @app.route("/api/courts")
 def get_courts():
+    if not os.path.exists(DB_PATH):
+        return jsonify([{**d, "count": 0} for d in [
+            {"value": "SCOTUS", "label": "Supreme Court"},
+            {"value": "F", "label": "Appeals Courts"},
+            {"value": "FD", "label": "District Courts"},
+            {"value": "FS", "label": "Special Jurisdiction"},
+        ]])
+    maybe_start_warmup()
+    conn = get_db()
+    try:
+        # Bankruptcy (FB) intentionally excluded
+        return jsonify(_load_court_counts(conn))
+    finally:
+        conn.close()
+
+def warn_no_fts():
+    global _warned_no_fts
+    if not _warned_no_fts:
+        _warned_no_fts = True
+        print("[search] WARNING: cases_fts index missing or empty - opinion-text search is "
+              "disabled (a LIKE scan over the text column would take minutes). Rebuild the "
+              "index with: python ingest_cases.py --build-fts", flush=True)
+
+def python_snippet(text, words, max_words=24):
+    """First-match-centered word window over the opinion text. Done in Python
+    on the (at most 20) page rows: the FTS5 snippet() JOIN could end up
+    iterating a huge MATCH set, which is slow on multi-million-case DBs."""
+    if not text or not words:
+        return None
+    toks = text.split()
+    if not toks:
+        return None
+    stripped = [t.strip('.,;:()[]{}"\'?!*#%&$') for t in toks]
+    hit = next((i for i, t in enumerate(stripped) if t.lower() in words), None)
+    if hit is None:
+        hit = next((i for i, t in enumerate(toks)
+                    if any(w in t.lower() for w in words)), None)
+    if hit is None:
+        s = " ".join(toks[:max_words])
+        return s + (" …" if len(toks) > max_words else "")
+    start = max(0, hit - 8)
+    end = min(len(toks), start + max_words)
+    s = " ".join(toks[start:end])
+    if start > 0:
+        s = "… " + s
+    if end < len(toks):
+        s += " …"
+    return s
+
+_COURTS_CACHE = {"ts": 0.0, "data": None}
+_BROWSE_FILTERED = {}
+_WARM = {"done": False}
+_WARM_LOCK = threading.Lock()
+
+def _load_court_counts(conn):
+    """Per-court-type counts via index-friendly queries; cached 10 minutes."""
+    if _COURTS_CACHE["data"] is not None and time.time() - _COURTS_CACHE["ts"] < 600:
+        return _COURTS_CACHE["data"]
     court_defs = [
         {"value": "SCOTUS", "label": "Supreme Court"},
         {"value": "F", "label": "Appeals Courts"},
         {"value": "FD", "label": "District Courts"},
         {"value": "FS", "label": "Special Jurisdiction"},
     ]
-    if not os.path.exists(DB_PATH):
-        return jsonify([{**d, "count": 0} for d in court_defs])
-
-    conn = get_db()
     cols = [col[1] for col in conn.execute("PRAGMA table_info(cases)").fetchall()]
     court_col = "court" if "court" in cols else "court_id"
 
     court_counts = {"SCOTUS": 0, "F": 0, "FD": 0, "FS": 0}
     if "court_type" in cols:
-        rows = conn.execute("SELECT UPPER(COALESCE(court_type, '')) as ctype, COUNT(*) as cnt FROM cases GROUP BY ctype").fetchall()
-        base = {r["ctype"]: r["cnt"] for r in rows}
+        # ingest stores canonical uppercase court_type / lowercase court ids,
+        # so plain GROUP BY rides the covering idx_cases_court_type.
+        rows = conn.execute(
+            "SELECT court_type as ctype, COUNT(*) as cnt FROM cases GROUP BY court_type"
+        ).fetchall()
+        base = {(r["ctype"] or "").upper(): r["cnt"] for r in rows}
         scotus_legacy = 0
         if base.get("F"):
             # Legacy DBs stored SCOTUS under court_type 'F'
             scotus_legacy = conn.execute(
-                "SELECT COUNT(*) as c FROM cases WHERE LOWER(COALESCE(court, '')) = 'scotus' AND UPPER(COALESCE(court_type, '')) = 'F'"
+                "SELECT COUNT(*) as c FROM cases WHERE court = 'scotus' AND court_type = 'F'"
             ).fetchone()["c"]
         court_counts["SCOTUS"] = base.get("SCOTUS", 0) + scotus_legacy
         court_counts["F"] = max(0, base.get("F", 0) - scotus_legacy)
@@ -140,10 +199,9 @@ def get_courts():
         if court_counts["FD"] == 0 and court_counts["F"] > 0:
             appellate_list = "','".join(["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"])
             special_list = "'ccpa', 'cusx', 'cit', 'cofc', 'armfor', 'cavc', 'tax'"
-            # Count SCOTUS and appeals using indexes
-            actual_appeals = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE LOWER({court_col}) IN ('{appellate_list}')").fetchone()["c"]
-            actual_scotus = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE LOWER({court_col}) = 'scotus'").fetchone()["c"]
-            actual_special = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE LOWER({court_col}) IN ({special_list})").fetchone()["c"]
+            actual_appeals = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE {court_col} IN ('{appellate_list}')").fetchone()["c"]
+            actual_scotus = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE {court_col} = 'scotus'").fetchone()["c"]
+            actual_special = conn.execute(f"SELECT COUNT(*) as c FROM cases WHERE {court_col} IN ({special_list})").fetchone()["c"]
             total_cases = conn.execute("SELECT COUNT(*) as c FROM cases").fetchone()["c"]
 
             court_counts["SCOTUS"] = actual_scotus
@@ -156,23 +214,66 @@ def get_courts():
             t = map_court_type(r["court"])
             if t in court_counts:
                 court_counts[t] += r["cnt"]
-    conn.close()
 
-    # Bankruptcy (FB) intentionally excluded
-    return jsonify([{**d, "count": court_counts[d["value"]]} for d in court_defs])
+    data = [{**d, "count": court_counts[d["value"]]} for d in court_defs]
+    _COURTS_CACHE["data"] = data
+    _COURTS_CACHE["ts"] = time.time()
+    return data
 
-def warn_no_fts():
-    global _warned_no_fts
-    if not _warned_no_fts:
-        _warned_no_fts = True
-        print("[search] WARNING: cases_fts index missing or empty - opinion-text search is "
-              "disabled (a LIKE scan over the text column would take minutes). Rebuild the "
-              "index with: python ingest_cases.py --build-fts", flush=True)
+def _run_warmup():
+    try:
+        conn = get_db()
+        try:
+            _load_court_counts(conn)
+            _BROWSE_TOTAL["value"] = conn.execute(
+                "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
+            _BROWSE_TOTAL["ts"] = time.time()
+            cols = [col[1] for col in conn.execute("PRAGMA table_info(cases)").fetchall()]
+            if "court_type" in cols:
+                db_has_bankruptcy(conn, "court_type")
+            if os.environ.get("CASEFIND_SKIP_INDEX") != "1":
+                try:
+                    # Ensure the indexes the fast paths rely on exist.
+                    # IF NOT EXISTS = no-op when present; built once in the
+                    # background so no user request ever waits on them.
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_court_type ON cases(court_type)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_court ON cases(court)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_date ON cases(date_filed)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_ctype_date ON cases(court_type, date_filed)")
+                    conn.commit()
+                except Exception as e:
+                    print(f"[warmup] index creation skipped: {e}", flush=True)
+            try:
+                # Table-scoped ANALYZE: gives the planner stats for the cases
+                # indexes only (a full ANALYZE would grind the FTS b-trees
+                # too). Skipped when stats already exist so restarts stay cheap.
+                has_stats = conn.execute(
+                    "SELECT 1 FROM sqlite_stat1 WHERE tbl = 'cases' LIMIT 1"
+                ).fetchone()
+                if not has_stats:
+                    conn.execute("ANALYZE cases")
+                    conn.commit()
+            except Exception:
+                pass
+        finally:
+            conn.close()
+        print("[warmup] caches warm (court counts, totals, indexes, stats)", flush=True)
+    except Exception as e:
+        print(f"[warmup] skipped: {e}", flush=True)
+
+def maybe_start_warmup():
+    with _WARM_LOCK:
+        if _WARM["done"]:
+            return
+        _WARM["done"] = True
+    threading.Thread(target=_run_warmup, daemon=True).start()
 
 @app.route("/api/search")
 def search():
     if not os.path.exists(DB_PATH):
         return jsonify({"total": 0, "page": 1, "page_size": 20, "results": []})
+
+    maybe_start_warmup()
 
     q = request.args.get("q", "").strip()
     scope = request.args.get("scope", "title").strip().lower()
@@ -196,6 +297,7 @@ def search():
         name_col = "name" if "name" in cols else ("case_name" if "case_name" in cols else cols[1])
         full_name_col = "case_name_full" if "case_name_full" in cols else None
         date_col = "date" if "date" in cols else ("date_filed" if "date_filed" in cols else "date")
+        text_col = "text" if "text" in cols else ("plain_text" if "plain_text" in cols else "content")
         court_col = "court" if "court" in cols else "court_id"
         cite_col = "citations" if "citations" in cols else None
         cite_cnt_col = "citation_count" if "citation_count" in cols else None
@@ -204,7 +306,6 @@ def search():
         # Detect FTS5 index and verify it contains rows
         has_fts = False
         fts_cols = []
-        fts_text_idx = 3
         try:
             fts_row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cases_fts'").fetchone()
             if fts_row:
@@ -212,13 +313,12 @@ def search():
                 # Verify that cases_fts has index data by testing a probe query
                 probe = conn.execute("SELECT 1 FROM cases_fts LIMIT 1").fetchone()
                 has_fts = bool(fts_cols) and (probe is not None)
-                if "text" in fts_cols:
-                    fts_text_idx = fts_cols.index("text")
         except Exception:
             has_fts = False
 
         fts_has_name = "name" in fts_cols
         fts_has_text = "text" in fts_cols
+        fts_has_cite = "citations" in fts_cols
 
         # Date index (created by ingest_cases.py). Forcing it for LIMIT-ed page
         # queries makes SQLite walk the index in reverse and stop as soon as
@@ -252,29 +352,33 @@ def search():
             if court_filter:
                 or_parts = []
                 if ctype_col:
+                    # ingest stores canonical values (uppercase court_type,
+                    # lowercase court ids), so plain equality lets SQLite use
+                    # idx_cases_court_type / idx_cases_court as covering seeks
+                    # instead of scanning every leaf page.
                     appellate_tuple = "','".join(["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"])
                     special_tuple = "'ccpa', 'cusx', 'cit', 'cofc', 'armfor', 'cavc', 'tax'"
                     for ct in court_filter:
                         if ct == "SCOTUS":
-                            or_parts.append(f"(UPPER({ctype_col}) = 'SCOTUS' OR LOWER({court_col}) = 'scotus')")
+                            or_parts.append(f"({ctype_col} = 'SCOTUS' OR {court_col} = 'scotus')")
                         elif ct == "F":
-                            or_parts.append(f"(UPPER({ctype_col}) = 'F' AND LOWER({court_col}) IN ('{appellate_tuple}'))")
+                            or_parts.append(f"({ctype_col} = 'F' AND {court_col} IN ('{appellate_tuple}'))")
                         elif ct == "FD":
-                            or_parts.append(f"(UPPER({ctype_col}) = 'FD' OR (UPPER({ctype_col}) = 'F' AND LOWER({court_col}) NOT IN ('scotus', '{appellate_tuple}', {special_tuple})))")
+                            or_parts.append(f"({ctype_col} = 'FD' OR ({ctype_col} = 'F' AND {court_col} NOT IN ('scotus', '{appellate_tuple}', {special_tuple})))")
                         elif ct == "FS":
-                            or_parts.append(f"(UPPER({ctype_col}) = 'FS' OR LOWER({court_col}) IN ({special_tuple}))")
+                            or_parts.append(f"({ctype_col} = 'FS' OR {court_col} IN ({special_tuple}))")
                         else:
-                            or_parts.append(f"UPPER({ctype_col}) = ?")
+                            or_parts.append(f"{ctype_col} = ?")
                             c_params.append(ct)
                 else:
                     appellate_ids = ",".join([f"'{c}'" for c in ["ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7", "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"]])
                     for ct in court_filter:
                         if ct == "SCOTUS":
-                            or_parts.append(f"LOWER({court_col}) = 'scotus'")
+                            or_parts.append(f"{court_col} = 'scotus'")
                         elif ct == "F":
-                            or_parts.append(f"LOWER({court_col}) IN ({appellate_ids})")
+                            or_parts.append(f"{court_col} IN ({appellate_ids})")
                         elif ct == "FB":
-                            or_parts.append(f"(LOWER({court_col}) LIKE '%bankr%' OR SUBSTR(LOWER({court_col}), -1) = 'b')")
+                            or_parts.append(f"({court_col} LIKE '%bankr%' OR SUBSTR({court_col}, -1) = 'b')")
                         else:
                             or_parts.append("1=0")
                 conds.append("(" + " OR ".join(or_parts) + ")")
@@ -282,7 +386,7 @@ def search():
             # Bankruptcy rows are excluded at ingestion time; only pay for this
             # filter (and lose the pure-FTS fast count) when such rows exist.
             if ctype_col and db_has_bankruptcy(conn, ctype_col):
-                conds.append(f"UPPER(COALESCE({ctype_col}, '')) <> 'FB'")
+                conds.append(f"({ctype_col} IS NULL OR {ctype_col} <> 'FB')")
             if year_from:
                 # Range predicates keep idx_cases_date usable (SUBSTR() would not)
                 conds.append(f"{date_col} >= ?")
@@ -322,16 +426,30 @@ def search():
         if not q:
             conds, c_params = row_filter_conds()
             where_sql = ("WHERE " + " AND ".join(conds)) if conds else ""
+            now = time.time()
             total = None
-            if not conds and _BROWSE_TOTAL["value"] is not None and time.time() - _BROWSE_TOTAL["ts"] < 30:
+            if not conds and _BROWSE_TOTAL["value"] is not None and now - _BROWSE_TOTAL["ts"] < 600:
                 total = _BROWSE_TOTAL["value"]
+            elif conds:
+                cached = _BROWSE_FILTERED.get((court_type, year_from, year_to))
+                if cached and now - cached["ts"] < 600:
+                    total = cached["total"]
             if total is None:
                 total = conn.execute(f"SELECT COUNT(*) AS total FROM cases {where_sql}", c_params).fetchone()["total"]
+                now = time.time()
                 if not conds:
                     _BROWSE_TOTAL["value"] = total
-                    _BROWSE_TOTAL["ts"] = time.time()
+                    _BROWSE_TOTAL["ts"] = now
+                else:
+                    if len(_BROWSE_FILTERED) > 64:
+                        _BROWSE_FILTERED.clear()
+                    _BROWSE_FILTERED[(court_type, year_from, year_to)] = {"ts": now, "total": total}
+            # Unfiltered browse rides the date index for instant pages; with
+            # filters let the planner choose so it can use the court_type
+            # index instead of fetching every row in date order.
+            hint = idx_hint if not conds else ""
             rows = conn.execute(
-                f"SELECT {select_sql} FROM cases {idx_hint} {where_sql} ORDER BY {date_col} DESC LIMIT ? OFFSET ?",
+                f"SELECT {select_sql} FROM cases {hint} {where_sql} ORDER BY {date_col} DESC LIMIT ? OFFSET ?",
                 c_params + [page_size, offset]).fetchall()
             return jsonify({"total": total, "page": page, "page_size": page_size,
                             "results": shape_rows(rows, snippets)})
@@ -351,15 +469,17 @@ def search():
             """Return (match count, newest fetch_n rows).
 
             Without row filters the count is a pure FTS count with no probes
-            into the main table at all; the page query rides the date index
-            and stops early instead of touching every single match."""
+            into the main table at all, and the page query rides the date
+            index and stops early. With filters the date index would instead
+            force a row fetch per index entry until the page fills, so let the
+            planner drive from the (covering) filter indexes."""
             if conds:
                 t = conn.execute(
                     f"SELECT COUNT(*) AS total FROM cases WHERE rowid IN "
                     f"(SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?){conds_sql}",
                     [match_q] + c_params).fetchone()["total"]
                 rows = conn.execute(
-                    f"SELECT {select_sql} FROM cases {idx_hint} WHERE rowid IN "
+                    f"SELECT {select_sql} FROM cases WHERE rowid IN "
                     f"(SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?){conds_sql}"
                     f" ORDER BY {date_col} DESC LIMIT ?",
                     [match_q] + c_params + [fetch_n]).fetchall()
@@ -403,18 +523,32 @@ def search():
             # name/citation LIKE pass below.
             used_fts, total, passes, primary_q = False, 0, [], None
 
-        # Citation search (query contains digits, e.g. "384 U.S. 436"): a
-        # separate bounded pass over the small citations column, merged with
-        # the FTS results. Fusing this into the FTS predicate with OR would
-        # force a full-table scan on every search. The window count keeps it
-        # to a single scan: match sets here are tiny.
-        if used_fts and cite_col and scope in ("title", "both") and any(ch.isdigit() for ch in q):
-            crows = conn.execute(
-                f"SELECT COUNT(*) OVER () AS _total, {select_sql} FROM cases {idx_hint} "
-                f"WHERE {cite_col} LIKE ?{conds_sql} ORDER BY {date_col} DESC LIMIT ?",
-                [f"%{q}%"] + c_params + [fetch_n]).fetchall()
-            total += crows[0]["_total"] if crows else 0
-            passes.append((crows, 0))
+        # Citation search (query contains digits, e.g. "384 U.S. 436"). When
+        # the FTS index has a citations column this is pure index lookups.
+        # Otherwise (index built before that column existed) it degrades to
+        # one bounded scan over the small citations column.
+        is_cite_q = any(ch.isdigit() for ch in q)
+        if used_fts and cite_col and is_cite_q and scope in ("title", "both"):
+            if fts_has_cite:
+                cite_q = build_fts_query(words, "citations")
+                if cite_q:
+                    ct, crows = fts_pass(cite_q)
+                    total += ct
+                    # Exact citation matches rank ahead of same-token matches
+                    # (e.g. "384 U.S. 436" before "384 F.3d 436").
+                    ql = q.lower()
+                    exact, token = [], []
+                    for r in crows:
+                        (exact if ql in str(r["citations"] or "").lower() else token).append(r)
+                    passes.append((exact, 0))
+                    passes.append((token, 1))
+            else:
+                crows = conn.execute(
+                    f"SELECT COUNT(*) OVER () AS _total, {select_sql} FROM cases {idx_hint} "
+                    f"WHERE {cite_col} LIKE ?{conds_sql} ORDER BY {date_col} DESC LIMIT ?",
+                    [f"%{q}%"] + c_params + [fetch_n]).fetchall()
+                total += crows[0]["_total"] if crows else 0
+                passes.append((crows, 0))
 
         # Zero results so far: retry over the name/citation columns only.
         # NEVER fall back to LIKE over the opinion text - that is a scan of
@@ -461,19 +595,18 @@ def search():
             page_rows.append(r)
         page_rows = page_rows[offset:offset + page_size]
 
-        if page_rows and used_fts and primary_q and scope in ("text", "both") and fts_has_text:
+        if page_rows and q and scope in ("text", "both") and words:
             try:
                 ids = [r["id"] for r in page_rows]
                 id_placeholders = ",".join(["?"] * len(ids))
-                snip_rows = conn.execute(
-                    f"""SELECT c.id as cid, snippet(cases_fts, {fts_text_idx}, '', '', '…', 24) as snip
-                        FROM cases_fts
-                        JOIN cases c ON c.rowid = cases_fts.rowid
-                        WHERE cases_fts MATCH ? AND c.id IN ({id_placeholders})""",
-                    [primary_q] + ids,
-                ).fetchall()
-                for sr in snip_rows:
-                    snippets[sr["cid"]] = re.sub(r"\s+", " ", sr["snip"]).strip()
+                trows = conn.execute(
+                    f"SELECT id, {text_col} FROM cases WHERE id IN ({id_placeholders})",
+                    ids).fetchall()
+                wl = {w.lower() for w in words if len(w) > 1}
+                for tr in trows:
+                    s = python_snippet(tr[1], wl)
+                    if s:
+                        snippets[tr[0]] = s
             except Exception:
                 snippets = {}
 

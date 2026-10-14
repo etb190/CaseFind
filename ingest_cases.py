@@ -15,7 +15,7 @@ import sqlite3
 import subprocess
 import argparse
 
-csv.field_size_limit(sys.maxsize)
+csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
 
 BULK_BASE = "https://com-courtlistener-storage.s3-us-west-2.amazonaws.com/bulk-data/"
 DEFAULT_DATE = "2026-09-30"
@@ -344,7 +344,18 @@ def build_fts(db_path=DB_PATH):
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL")
-        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS cases_fts USING fts5(id, name, court, text, content='cases', content_rowid='rowid')")
+        # Older FTS tables lack the citations column; rebuild the table so
+        # citation searches run on the index instead of a full table scan.
+        existing = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='cases_fts'"
+        ).fetchone()
+        if existing:
+            fts_cols = [r[1] for r in cur.execute("PRAGMA table_info(cases_fts)").fetchall()]
+            if "citations" not in fts_cols:
+                print("[search] Existing FTS index predates the citations column - rebuilding table...")
+                cur.execute("DROP TABLE cases_fts")
+        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS cases_fts USING fts5("
+                    "id, name, court, text, citations, content='cases', content_rowid='rowid')")
         cur.execute("INSERT INTO cases_fts(cases_fts) VALUES('rebuild')")
         conn.commit()
         conn.close()
