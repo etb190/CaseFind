@@ -341,10 +341,16 @@ def build_fts(db_path=DB_PATH):
     print(f"\n[search] Building SQLite FTS5 full-text search index in {db_path}...")
     t0 = time.time()
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=300)
         cur = conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL")
-        # Older FTS tables lack the citations column; rebuild the table so
+        cur.execute("PRAGMA busy_timeout=300000")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        # Keep the -wal file small: a single giant 'rebuild' transaction would
+        # pile the whole multi-GB index into the WAL before committing.
+        cur.execute("PRAGMA wal_autocheckpoint=1000")
+
+        # Older FTS tables lack the citations column; recreate the table so
         # citation searches run on the index instead of a full table scan.
         existing = cur.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='cases_fts'"
@@ -352,16 +358,62 @@ def build_fts(db_path=DB_PATH):
         if existing:
             fts_cols = [r[1] for r in cur.execute("PRAGMA table_info(cases_fts)").fetchall()]
             if "citations" not in fts_cols:
-                print("[search] Existing FTS index predates the citations column - rebuilding table...")
+                print("[search] Existing FTS index predates the citations column - recreating table...")
                 cur.execute("DROP TABLE cases_fts")
-        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS cases_fts USING fts5("
-                    "id, name, court, text, citations, content='cases', content_rowid='rowid')")
-        cur.execute("INSERT INTO cases_fts(cases_fts) VALUES('rebuild')")
+                existing = None
+        if not existing:
+            cur.execute("CREATE VIRTUAL TABLE cases_fts USING fts5("
+                        "id, name, court, text, citations, content='cases', content_rowid='rowid')")
+            conn.commit()
+        else:
+            # Right shape already: skip entirely if a previous run completed.
+            try:
+                indexed = cur.execute("SELECT COUNT(*) FROM cases_fts_docsize").fetchone()[0]
+            except sqlite3.OperationalError:
+                indexed = -1
+            total_now = cur.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+            if indexed == total_now:
+                print(f"[search] FTS index already complete ({total_now:,} cases) - nothing to do.")
+                conn.close()
+                return
+            if indexed >= 0:
+                print(f"[search] Incomplete index ({indexed:,}/{total_now:,}) - rebuilding from scratch...")
+
+        cur.execute("INSERT INTO cases_fts(cases_fts) VALUES('delete-all')")
         conn.commit()
+        total = cur.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+        if not total:
+            conn.close()
+            print("[search] Empty database - nothing to index.")
+            return
+        lo = cur.execute("SELECT MIN(rowid) FROM cases").fetchone()[0] or 1
+        hi = cur.execute("SELECT MAX(rowid) FROM cases").fetchone()[0] or 0
+        BATCH = 25_000
+        done = 0
+        start = lo
+        print(f"[search] Indexing {total:,} cases in batches of {BATCH:,} "
+              f"(progress printed every batch)...", flush=True)
+        while start <= hi:
+            end = min(start + BATCH - 1, hi)
+            cur.execute(
+                "INSERT INTO cases_fts(rowid, id, name, court, text, citations) "
+                "SELECT rowid, id, name, court, text, citations FROM cases "
+                "WHERE rowid BETWEEN ? AND ?", (start, end))
+            done += cur.rowcount or 0
+            conn.commit()
+            rate = done / max(1e-9, time.time() - t0)
+            eta = (total - done) / rate / 60 if rate > 1 else 0
+            eta_s = f", ~{eta:.0f} min left" if eta >= 1 else ""
+            print(f"  [fts] {done:,}/{total:,} cases indexed "
+                  f"({rate:,.0f}/s{eta_s})", flush=True)
+            start = end + 1
         conn.close()
-        print(f"[search] FTS5 full-text index built successfully in {time.time()-t0:.1f}s.")
+        print(f"[search] FTS5 index built successfully in {(time.time()-t0)/60:.1f} min "
+              f"({total:,} cases, citations included).")
     except Exception as e:
-        print(f"[search] Note: FTS5 indexing error: {e}")
+        print(f"[search] FTS5 indexing error: {e}")
+        print("[search] The index may be incomplete - simply re-run this command; "
+              "it starts a clean rebuild.", flush=True)
 
 def fix_court_types(db_path=DB_PATH):
     print(f"\n[maintenance] Repairing court_type values in {db_path}...")
