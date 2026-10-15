@@ -454,13 +454,22 @@ def build_names_fts(db_path=DB_PATH):
             return
         lo = cur.execute("SELECT MIN(rowid) FROM cases").fetchone()[0] or 1
         hi = cur.execute("SELECT MAX(rowid) FROM cases").fetchone()[0] or 0
-        # Resume from the highest indexed rowid (batches commit in rowid order)
-        try:
-            start = (cur.execute("SELECT MAX(rowid) FROM cases_names_fts_docsize").fetchone()[0] or 0) + 1
-        except sqlite3.OperationalError:
-            start = lo
-        if start < lo:
-            start = lo
+        start = lo
+        if 0 < indexed <= total:
+            # Resume from the highest indexed rowid (batches commit in order)
+            try:
+                start = (cur.execute("SELECT MAX(rowid) FROM cases_names_fts_docsize").fetchone()[0] or 0) + 1
+                if start < lo:
+                    start = lo
+            except sqlite3.OperationalError:
+                start = lo
+        elif indexed > total:
+            # More index entries than cases (rows removed without FTS
+            # maintenance): the top-up resume cannot repair that - rebuild.
+            print("[search] Index has stale entries - rebuilding from scratch...", flush=True)
+            cur.execute("INSERT INTO cases_names_fts(cases_names_fts) VALUES('delete-all')")
+            conn.commit()
+            indexed = 0
         BATCH = 50_000
         done = max(indexed, 0)
         print(f"[search] Indexing names/citations for {total:,} cases "
