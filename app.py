@@ -264,51 +264,51 @@ def _names_fts_ready(conn):
     except Exception:
         return False
 
-def _refresh_caches():
-    """One synchronous read-only cache refresh (court counts, browse total,
-    name-index readiness). Runs at startup BEFORE the server listens, so the
-    first user request never pays the cold-scan cost (minutes on large
-    databases)."""
-    if not os.path.exists(DB_PATH):
-        return
-    conn = get_db()
-    try:
-        _load_court_counts(conn, force=True)
-        _BROWSE_TOTAL["value"] = conn.execute(
-            "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
-        _BROWSE_TOTAL["ts"] = time.time()
-        _NAMES_FTS["ok"] = _names_fts_ready(conn)
-    finally:
-        conn.close()
+def _refresh_totals_and_names(conn):
+    """The search-critical cache refresh: browse total + the name-index
+    routing flag. Two small index counts - cheap even on huge databases.
+    Everything else (court counts) is warmed in the background."""
+    _BROWSE_TOTAL["value"] = conn.execute(
+        "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
+    _BROWSE_TOTAL["ts"] = time.time()
+    _NAMES_FTS["ok"] = _names_fts_ready(conn)
 
 def _run_warmup():
-    """Recurring background maintenance (read-only): keeps the court counts,
-    browse total and bankruptcy flag caches fresh so no user request ever
-    recomputes them. The first pass is normally already warm from the
-    blocking startup refresh in __main__.
+    """Background bootstrap for the caches not warmed synchronously at
+    startup: court counts (court dropdown), and the name-index flag if
+    startup could not verify it. Retries with backoff; once warm, the thread
+    exits - the app is read-only, so cached values cannot change while it
+    runs, and there is nothing to refresh.
 
     The app NEVER writes to the database: index builds and ANALYZE are long
     write transactions, and on network filesystems (Lightning's teamspace)
     a long writer wedges every concurrent reader. Indexes belong to:
     python ingest_cases.py --ensure-indexes (run with the app stopped)."""
-    runs = 0
+    tries = names_tries = 0
     while True:
+        need_courts = _COURTS_CACHE["data"] is None
+        need_names = (not _NAMES_FTS["ok"]) and names_tries < 5
+        if not need_courts and not need_names:
+            if not _NAMES_FTS["ok"]:
+                print("[warmup] note: name/citation index not present or incomplete - "
+                      "title searches use the main index until it is built "
+                      "(python ingest_cases.py --build-fts) and the app restarts.", flush=True)
+            print("[warmup] all caches warm.", flush=True)
+            return
         try:
             conn = get_db()
             try:
-                _load_court_counts(conn, force=(runs > 0))
-                if _BROWSE_TOTAL["value"] is None or time.time() - _BROWSE_TOTAL["ts"] >= 3600:
-                    _BROWSE_TOTAL["value"] = conn.execute(
-                        "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
-                    _BROWSE_TOTAL["ts"] = time.time()
+                if need_courts:
+                    _load_court_counts(conn)
+                if need_names:
+                    names_tries += 1
+                    _refresh_totals_and_names(conn)
             finally:
                 conn.close()
-            if runs == 0:
-                print("[warmup] background cache refresh running (every 30 min)", flush=True)
         except Exception as e:
-            print(f"[warmup] refresh skipped: {e}", flush=True)
-        runs += 1
-        time.sleep(1800)
+            print(f"[warmup] deferred: {e}", flush=True)
+        tries += 1
+        time.sleep(min(600, 30 * tries))
 
 def maybe_start_warmup():
     with _WARM_LOCK:
@@ -762,14 +762,20 @@ def start_ngrok(port=8001):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8001))
-    print("[startup] Warming search caches (one-time per restart; can take a "
-          "few minutes on large databases)...", flush=True)
+    # Block only on what search speed depends on: the browse total and the
+    # name-index routing flag (two small index counts). Court counts warm in
+    # the background - they only feed the court dropdown labels.
+    print("[startup] Quick warm: verifying search indexes (a few moments)...", flush=True)
     try:
-        _refresh_caches()
-        print("[startup] Caches warm.", flush=True)
+        if os.path.exists(DB_PATH):
+            conn = get_db()
+            try:
+                _refresh_totals_and_names(conn)
+            finally:
+                conn.close()
+        print("[startup] Ready - search is fast from the first request.", flush=True)
     except Exception as e:
-        print(f"[startup] Cache warmup skipped: {e} - continuing; the "
-              "background refresh will retry.", flush=True)
+        print(f"[startup] Quick warm skipped: {e} - the background task will retry.", flush=True)
     maybe_start_warmup()
     start_ngrok(port)
     print(f"Local server listening on http://0.0.0.0:{port} (DB: {DB_PATH})")
