@@ -181,6 +181,7 @@ def python_snippet(text, words, max_words=24):
 _COURTS_CACHE = {"ts": 0.0, "data": None, "has_fb": None}
 _BROWSE_FILTERED = {}
 _NAMES_FTS = {"ok": False}
+_CANONICAL = {"ok": None}
 _WARM = {"done": False}
 _WARM_LOCK = threading.Lock()
 
@@ -264,14 +265,42 @@ def _names_fts_ready(conn):
     except Exception:
         return False
 
+def _check_canonical(conn):
+    """True when court_type values match the canonical ingest mapping: no
+    SCOTUS rows hidden under another type, and the F/SCOTUS slices contain
+    exactly the appeals + SCOTUS courts. When canonical, court filters are
+    single-column seeks (instant via the composite court_type/date index);
+    otherwise the tolerant OR forms are kept. A false negative only keeps
+    the slow-but-correct path, so failure here is safe."""
+    try:
+        if conn.execute(
+            "SELECT 1 FROM cases WHERE court = 'scotus' AND COALESCE(court_type, '') <> 'SCOTUS' LIMIT 1"
+        ).fetchone():
+            return False
+        appellate = "','".join(["scotus", "ca1", "ca2", "ca3", "ca4", "ca5", "ca6", "ca7",
+                                "ca8", "ca9", "ca10", "ca11", "cadc", "cafc"])
+        n_type = conn.execute(
+            "SELECT COUNT(*) FROM cases WHERE court_type IN ('F', 'SCOTUS')").fetchone()[0]
+        n_court = conn.execute(
+            f"SELECT COUNT(*) FROM cases WHERE court IN ('{appellate}')").fetchone()[0]
+        return n_type == n_court
+    except Exception:
+        return False
+
 def _refresh_totals_and_names(conn):
-    """The search-critical cache refresh: browse total + the name-index
-    routing flag. Two small index counts - cheap even on huge databases.
-    Everything else (court counts) is warmed in the background."""
+    """The search-critical cache refresh: browse total, name-index routing
+    flag, canonical-court check and bankruptcy flag. Small index counts -
+    cheap even on huge databases. Everything else (court counts) is warmed
+    in the background."""
     _BROWSE_TOTAL["value"] = conn.execute(
         "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
     _BROWSE_TOTAL["ts"] = time.time()
     _NAMES_FTS["ok"] = _names_fts_ready(conn)
+    _CANONICAL["ok"] = _check_canonical(conn)
+    try:
+        db_has_bankruptcy(conn, "court_type")
+    except Exception:
+        pass
 
 def _run_warmup():
     """Background bootstrap for the caches not warmed synchronously at
@@ -284,11 +313,12 @@ def _run_warmup():
     write transactions, and on network filesystems (Lightning's teamspace)
     a long writer wedges every concurrent reader. Indexes belong to:
     python ingest_cases.py --ensure-indexes (run with the app stopped)."""
-    tries = names_tries = 0
+    tries = names_tries = canon_tries = 0
     while True:
         need_courts = _COURTS_CACHE["data"] is None
         need_names = (not _NAMES_FTS["ok"]) and names_tries < 5
-        if not need_courts and not need_names:
+        need_canon = (_CANONICAL["ok"] is None) and canon_tries < 5
+        if not need_courts and not need_names and not need_canon:
             if not _NAMES_FTS["ok"]:
                 print("[warmup] note: name/citation index not present or incomplete - "
                       "title searches use the main index until it is built "
@@ -300,8 +330,9 @@ def _run_warmup():
             try:
                 if need_courts:
                     _load_court_counts(conn)
-                if need_names:
-                    names_tries += 1
+                if need_names or need_canon:
+                    names_tries += 1 if need_names else 0
+                    canon_tries += 1 if need_canon else 0
                     _refresh_totals_and_names(conn)
             finally:
                 conn.close()
@@ -374,6 +405,7 @@ def search():
         # the page is filled, instead of probing the main table once per FTS
         # match and sorting the entire match set.
         date_idx = None
+        ctype_date_idx = None
         try:
             idx_names = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='cases'").fetchall()}
@@ -381,6 +413,8 @@ def search():
                 if cand in idx_names:
                     date_idx = cand
                     break
+            if "idx_cases_ctype_date" in idx_names:
+                ctype_date_idx = "idx_cases_ctype_date"
         except Exception:
             date_idx = None
         idx_hint = f"INDEXED BY {date_idx}" if date_idx else ""
@@ -397,10 +431,21 @@ def search():
         def row_filter_conds():
             conds = []
             c_params = []
+            pure_court = None   # single canonical court_type value, or None
             court_filter = [c.strip().upper() for c in court_type.split(",") if c.strip()]
             if court_filter:
                 or_parts = []
-                if ctype_col:
+                if ctype_col and _CANONICAL["ok"]:
+                    # Canonical court_type values: a plain equality seek rides
+                    # the composite (court_type, date_filed) index directly.
+                    # The tolerant OR forms below only help legacy/mislabeled
+                    # databases - and cost orders of magnitude more.
+                    for ct in court_filter:
+                        or_parts.append(f"{ctype_col} = ?")
+                        c_params.append(ct)
+                    if len(court_filter) == 1:
+                        pure_court = court_filter[0]
+                elif ctype_col:
                     # ingest stores canonical values (uppercase court_type,
                     # lowercase court ids), so plain equality lets SQLite use
                     # idx_cases_court_type / idx_cases_court as covering seeks
@@ -443,7 +488,7 @@ def search():
             if year_to:
                 conds.append(f"{date_col} <= ?")
                 c_params.append(f"{year_to}-12-31")
-            return conds, c_params
+            return conds, c_params, pure_court
 
         def shape_rows(rows, snippets):
             results = []
@@ -473,7 +518,7 @@ def search():
 
         # ---------- Browse mode (no query) ----------
         if not q:
-            conds, c_params = row_filter_conds()
+            conds, c_params, pure_court = row_filter_conds()
             where_sql = ("WHERE " + " AND ".join(conds)) if conds else ""
             now = time.time()
             total = None
@@ -483,6 +528,11 @@ def search():
                 cached = _BROWSE_FILTERED.get((court_type, year_from, year_to))
                 if cached and now - cached["ts"] < 3600:
                     total = cached["total"]
+                elif (pure_court and not year_from and not year_to
+                      and _COURTS_CACHE["data"] is not None):
+                    # Same number the court dropdown shows - no scan needed.
+                    total = next((d["count"] for d in _COURTS_CACHE["data"]
+                                  if d["value"] == pure_court), None)
             if total is None:
                 total = conn.execute(f"SELECT COUNT(*) AS total FROM cases {where_sql}", c_params).fetchone()["total"]
                 now = time.time()
@@ -493,10 +543,13 @@ def search():
                     if len(_BROWSE_FILTERED) > 64:
                         _BROWSE_FILTERED.clear()
                     _BROWSE_FILTERED[(court_type, year_from, year_to)] = {"ts": now, "total": total}
-            # Unfiltered browse rides the date index for instant pages; with
-            # filters let the planner choose so it can use the court_type
-            # index instead of fetching every row in date order.
+            # Unfiltered browse rides the date index; a single canonical
+            # court filter rides the composite (court_type, date_filed)
+            # index, which is already in newest-first order within the
+            # court's slice - no sort, no scan of every matching row.
             hint = idx_hint if not conds else ""
+            if pure_court and not _FB_CHECK["has"] and ctype_date_idx:
+                hint = f"INDEXED BY {ctype_date_idx}"
             rows = conn.execute(
                 f"SELECT {select_sql} FROM cases {hint} {where_sql} ORDER BY {date_col} DESC LIMIT ? OFFSET ?",
                 c_params + [page_size, offset]).fetchall()
@@ -513,7 +566,7 @@ def search():
         fts_any_q = build_fts_query(words, None) if (has_fts and words) else None
         name_table = "cases_names_fts" if names_ready else "cases_fts"
 
-        conds, c_params = row_filter_conds()
+        conds, c_params, pure_q = row_filter_conds()
         conds_sql = (" AND " + " AND ".join(conds)) if conds else ""
 
         def fts_pass(match_q, table="cases_fts"):
@@ -529,8 +582,16 @@ def search():
                     f"SELECT COUNT(*) AS total FROM cases WHERE rowid IN "
                     f"(SELECT rowid FROM {table} WHERE {table} MATCH ?){conds_sql}",
                     [match_q] + c_params).fetchone()["total"]
+                # With a large match set the unhinted plan fetches one row per
+                # match to sort by date; the composite index instead walks
+                # only the court's slice, which is already date-ordered.
+                # Only valid for a single canonical court filter, and not
+                # worth it for small match sets.
+                hint = ""
+                if pure_q and not _FB_CHECK["has"] and ctype_date_idx and t > 5000:
+                    hint = f"INDEXED BY {ctype_date_idx}"
                 rows = conn.execute(
-                    f"SELECT {select_sql} FROM cases WHERE rowid IN "
+                    f"SELECT {select_sql} FROM cases {hint} WHERE rowid IN "
                     f"(SELECT rowid FROM {table} WHERE {table} MATCH ?){conds_sql}"
                     f" ORDER BY {date_col} DESC LIMIT ?",
                     [match_q] + c_params + [fetch_n]).fetchall()
@@ -621,8 +682,13 @@ def search():
             if cite_col:
                 cond = f"({cond} OR {cite_col} LIKE ?)"
                 lparams.append(f"%{q}%")
+            f_hint = idx_hint
+            if pure_q and not _FB_CHECK["has"] and ctype_date_idx:
+                # Search only the court's slice of the composite index
+                # instead of fetching rows across the whole table.
+                f_hint = f"INDEXED BY {ctype_date_idx}"
             lrows = conn.execute(
-                f"SELECT COUNT(*) OVER () AS _total, {select_sql} FROM cases {idx_hint} "
+                f"SELECT COUNT(*) OVER () AS _total, {select_sql} FROM cases {f_hint} "
                 f"WHERE {cond}{conds_sql} ORDER BY {date_col} DESC LIMIT ?",
                 lparams + c_params + [fetch_n]).fetchall()
             lt = lrows[0]["_total"] if lrows else 0
