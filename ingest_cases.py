@@ -93,6 +93,12 @@ def stream_csv(name, date_str):
     return rd, p
 
 def clean_text(raw_row):
+    """Opinion text with real paragraph breaks preserved.
+
+    plain_text keeps newlines; every newline run becomes a paragraph break
+    (blank line). Spaces/tabs within a line are collapsed. When only HTML is
+    available, block-level tags are turned into paragraph breaks before the
+    remaining markup is stripped to spaces."""
     t = raw_row.get("plain_text") or ""
     if not t.strip():
         html_content = (
@@ -101,8 +107,14 @@ def clean_text(raw_row):
             raw_row.get("html") or
             raw_row.get("xml_harvard") or ""
         )
-        t = html.unescape(re.sub(r"<[^>]+>", " ", html_content))
-    return re.sub(r"\s+", " ", t).strip()
+        t = re.sub(
+            r"<\s*/?\s*(p|div|br|h[1-6]|blockquote|li|tr|section|article|fn|footnote)[^>]*>",
+            "\n\n", html_content, flags=re.IGNORECASE)
+        t = html.unescape(re.sub(r"<[^>]+>", " ", t))
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r" *\n+ *", "\n\n", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 def map_court_category(court_id, jurisdiction=""):
     cid = (court_id or "").lower()
@@ -519,9 +531,11 @@ def purge_short_cases(db_path=DB_PATH, min_words=300, dry_run=False):
     has_names_fts = bool(cur.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cases_names_fts'").fetchone())
 
-    # words = spaces + 1 (ingest collapses all whitespace to single spaces);
+    # words = whitespace separators + 1, works for both collapsed texts and
+    # paragraph-restored ones (a paragraph break counts ~1 word extra);
     # NULL/empty text counts as 0 words.
-    WORDS = "COALESCE(LENGTH(text) - LENGTH(REPLACE(text, ' ', '')) + 1, 0)"
+    WORDS = ("COALESCE(LENGTH(text) - LENGTH(REPLACE(REPLACE(REPLACE(REPLACE(text, ' ', ''), "
+             "CHAR(10), ''), CHAR(13), ''), CHAR(9), '')) + 1, 0)")
 
     if dry_run:
         rows = cur.execute(
@@ -587,9 +601,9 @@ def sample_short_cases(db_path=DB_PATH, min_words=300, count=20):
           f"{min_words} words from {db_path} (nothing is deleted)...\n")
     conn = sqlite3.connect(db_path, timeout=300)
     cur = conn.cursor()
-    # Same formula as the purge: words = spaces + 1 (whitespace-normalized
-    # at ingest); NULL/empty text counts as 0.
-    WORDS = "COALESCE(LENGTH(text) - LENGTH(REPLACE(text, ' ', '')) + 1, 0)"
+    # Same formula as the purge: whitespace separators + 1.
+    WORDS = ("COALESCE(LENGTH(text) - LENGTH(REPLACE(REPLACE(REPLACE(REPLACE(text, ' ', ''), "
+             "CHAR(10), ''), CHAR(13), ''), CHAR(9), '')) + 1, 0)")
     lo = cur.execute("SELECT MIN(rowid) FROM cases").fetchone()[0] or 1
     hi = cur.execute("SELECT MAX(rowid) FROM cases").fetchone()[0] or 0
     victims, probes = [], 0
@@ -613,6 +627,114 @@ def sample_short_cases(db_path=DB_PATH, min_words=300, count=20):
         print()
     print(f"[purge] {len(victims)} sampled case(s) shown. Word counts use the "
           f"same formula as the purge itself. Re-run for a fresh random sample.")
+
+def _restore_progress_path(db_path):
+    return str(db_path) + ".restore-progress.json"
+
+def _restore_core(conn, rows_iter, ppath=None):
+    """Apply paragraph-preserving clean_text to opinions already in the
+    database. rows_iter yields the opinions dump's csv row dicts; rows are
+    matched by opinion id and only the text column is updated - nothing is
+    inserted or deleted, so no FTS rebuild is needed (whitespace changes do
+    not move FTS5 token positions). ppath: progress file for resumption."""
+    import json as _json
+    cur = conn.cursor()
+    pending, updates = [], []
+    seen = updated = 0
+    last_id = None
+    resume_after = None
+    if ppath and os.path.exists(ppath):
+        try:
+            with open(ppath) as f:
+                resume_after = _json.load(f).get("last_id")
+        except Exception:
+            resume_after = None
+
+    t0 = time.time()
+
+    def match_and_clean():
+        ids = [oid for oid, _ in pending]
+        ph = ",".join("?" * len(ids))
+        found = {row[0] for row in cur.execute(
+            f"SELECT id FROM cases WHERE id IN ({ph})", ids)}
+        for oid, row in pending:
+            if oid in found:
+                text = clean_text(row)
+                if len(text) >= MIN_CHARS:
+                    updates.append((text, oid))
+
+    def flush():
+        nonlocal updated
+        if updates:
+            cur.executemany("UPDATE cases SET text = ? WHERE id = ?", updates)
+            conn.commit()
+            updated += len(updates)
+            updates.clear()
+            rate = seen / max(1e-9, time.time() - t0)
+            print(f"  [restore] scanned {seen:,} opinions | updated {updated:,} "
+                  f"cases ({rate:,.0f} rows/s)", flush=True)
+        # Never overwrite the progress file while still skipping (if the
+        # resume point is never found, e.g. a different dump date, the
+        # original marker must survive).
+        if ppath and last_id and not resume_after:
+            try:
+                with open(ppath, "w") as f:
+                    _json.dump({"last_id": last_id}, f)
+            except Exception:
+                pass
+
+    for r in rows_iter:
+        oid = str(r.get("id") or "")
+        seen += 1
+        if oid:
+            last_id = oid
+        if resume_after:
+            if oid == resume_after:
+                resume_after = None   # this one was already processed; skip it
+            continue
+        if oid:
+            pending.append((oid, r))
+        if len(pending) >= 5000:
+            match_and_clean()
+            pending.clear()
+        if len(updates) >= 5000:
+            flush()
+    if pending:
+        match_and_clean()
+    flush()
+    return seen, updated
+
+def restore_paragraphs(db_path=DB_PATH, date_str=DEFAULT_DATE):
+    """Re-stream the opinions bulk dump and replace each stored case's text
+    with a paragraph-preserving version. Run with the app stopped. Matches by
+    opinion id; updates only the text column, so no reindex is needed.
+    Resumable via a progress file next to the database."""
+    print(f"\n[restore] Streaming the {date_str} opinions dump to restore paragraph "
+          f"breaks into {db_path}...", flush=True)
+    t0 = time.time()
+    conn = sqlite3.connect(db_path, timeout=300)
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA busy_timeout=300000")
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.execute("PRAGMA wal_autocheckpoint=1000")
+    total_cases = cur.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+    print(f"[restore] {total_cases:,} cases in the database; matching by opinion id "
+          f"(no reindexing needed afterwards).", flush=True)
+    ppath = _restore_progress_path(db_path)
+    rd, p = stream_csv("opinions", date_str)
+    try:
+        seen, updated = _restore_core(conn, rd, ppath)
+    finally:
+        p.kill()
+        conn.close()
+    try:
+        os.remove(ppath)
+    except Exception:
+        pass
+    print(f"[restore] Done: scanned {seen:,} opinions, updated {updated:,} case "
+          f"texts in {(time.time()-t0)/60:.1f} min. Paragraph breaks restored.",
+          flush=True)
 
 def ensure_indexes(db_path=DB_PATH):
     """Create the indexes CaseFind's fast search paths rely on, and give the
@@ -699,7 +821,13 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="With --purge-short: report what would be deleted, without deleting")
     parser.add_argument("--sample", type=int, default=None, metavar="N",
                         help="With --purge-short: print N random matching cases with full text, without deleting")
+    parser.add_argument("--restore-paragraphs", action="store_true",
+                        help="Re-stream the opinions dump and restore real paragraph breaks in stored texts (app stopped; no reindex needed)")
     args = parser.parse_args()
+
+    if args.restore_paragraphs:
+        restore_paragraphs(DB_PATH, date_str=args.date)
+        sys.exit(0)
 
     if args.purge_short is not None:
         if args.sample:
