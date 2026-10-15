@@ -569,6 +569,42 @@ def purge_short_cases(db_path=DB_PATH, min_words=300, dry_run=False):
     print(f"[purge] Deleted {deleted:,} cases; {remaining:,} remain "
           f"({(time.time()-t0)/60:.1f} min). Start the app to refresh its counts.")
 
+def sample_short_cases(db_path=DB_PATH, min_words=300, count=20):
+    """Print N random cases that --purge-short would delete, with their full
+    text, so the purge list can be eyeballed before deleting. Uses random
+    rowid probes (instant) instead of scanning the whole corpus."""
+    import random as _random
+    print(f"\n[purge] Sampling up to {count} random cases with fewer than "
+          f"{min_words} words from {db_path} (nothing is deleted)...\n")
+    conn = sqlite3.connect(db_path, timeout=300)
+    cur = conn.cursor()
+    # Same formula as the purge: words = spaces + 1 (whitespace-normalized
+    # at ingest); NULL/empty text counts as 0.
+    WORDS = "COALESCE(LENGTH(text) - LENGTH(REPLACE(text, ' ', '')) + 1, 0)"
+    lo = cur.execute("SELECT MIN(rowid) FROM cases").fetchone()[0] or 1
+    hi = cur.execute("SELECT MAX(rowid) FROM cases").fetchone()[0] or 0
+    victims, probes = [], 0
+    while len(victims) < count and probes < 20000 and hi >= lo:
+        ids = _random.sample(range(lo, hi + 1), min(500, max(count * 25, 100)))
+        ph = ",".join("?" * len(ids))
+        rows = cur.execute(
+            f"SELECT name, COALESCE(court, '?'), COALESCE(court_type, '?'), "
+            f"COALESCE(date_filed, '?'), COALESCE(text, ''), {WORDS} FROM cases "
+            f"WHERE rowid IN ({ph}) AND {WORDS} < ?",
+            ids + [min_words]).fetchall()
+        victims.extend(rows)
+        probes += len(ids)
+    conn.close()
+    victims = victims[:count]
+    for i, (name, court, ctype, date, text, words) in enumerate(victims, 1):
+        print(f"  {i}. {name}")
+        print(f"     {court} ({ctype}) - filed {date} - {words} words")
+        print(f"     {'-' * 70}")
+        print("     " + " ".join((text or "").split()))
+        print()
+    print(f"[purge] {len(victims)} sampled case(s) shown. Word counts use the "
+          f"same formula as the purge itself. Re-run for a fresh random sample.")
+
 def ensure_indexes(db_path=DB_PATH):
     """Create the indexes CaseFind's fast search paths rely on, and give the
     query planner stats. Run with the app stopped: these are long write
@@ -652,10 +688,15 @@ if __name__ == "__main__":
     parser.add_argument("--purge-short", type=int, default=None, metavar="MIN_WORDS",
                         help="Delete cases whose opinion text has fewer than MIN_WORDS words, all courts (run with the app stopped)")
     parser.add_argument("--dry-run", action="store_true", help="With --purge-short: report what would be deleted, without deleting")
+    parser.add_argument("--sample", type=int, default=None, metavar="N",
+                        help="With --purge-short: print N random matching cases with full text, without deleting")
     args = parser.parse_args()
 
     if args.purge_short is not None:
-        purge_short_cases(DB_PATH, min_words=args.purge_short, dry_run=args.dry_run)
+        if args.sample:
+            sample_short_cases(DB_PATH, min_words=args.purge_short, count=args.sample)
+        else:
+            purge_short_cases(DB_PATH, min_words=args.purge_short, dry_run=args.dry_run)
         sys.exit(0)
 
     if args.ensure_indexes:
