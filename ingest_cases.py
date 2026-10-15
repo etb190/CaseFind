@@ -339,6 +339,12 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
     print("=" * 60 + "\n")
 
 def build_fts(db_path=DB_PATH):
+    """Build both search indexes: the full opinion-text FTS index and the
+    small name/citation index used for fast title and citation searches."""
+    _build_main_fts(db_path)
+    build_names_fts(db_path)
+
+def _build_main_fts(db_path=DB_PATH):
     print(f"\n[search] Building SQLite FTS5 full-text search index in {db_path}...")
     t0 = time.time()
     try:
@@ -415,6 +421,69 @@ def build_fts(db_path=DB_PATH):
         print(f"[search] FTS5 indexing error: {e}")
         print("[search] The index may be incomplete - simply re-run this command; "
               "it starts a clean rebuild.", flush=True)
+
+def build_names_fts(db_path=DB_PATH):
+    """Small FTS5 index over just (id, name, citations).
+
+    In the full index, a common word like 'president' carries postings from
+    every opinion whose TEXT mentions it - millions of entries - so an
+    11-word case-name AND query decodes giant doclists even though it only
+    matches a handful of names. This index carries only name/citation
+    postings (~100x smaller), making title and citation searches index-only.
+    Completeness-checked and resumable: re-runs only top up missing rows."""
+    print(f"\n[search] Ensuring name/citation index (cases_names_fts) in {db_path}...")
+    t0 = time.time()
+    try:
+        conn = sqlite3.connect(db_path, timeout=300)
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=300000")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA wal_autocheckpoint=1000")
+        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS cases_names_fts USING fts5("
+                    "id, name, citations, content='cases', content_rowid='rowid')")
+        conn.commit()
+        try:
+            indexed = cur.execute("SELECT COUNT(*) FROM cases_names_fts_docsize").fetchone()[0]
+        except sqlite3.OperationalError:
+            indexed = -1
+        total = cur.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+        if indexed == total and total > 0:
+            print(f"[search] Name/citation index already complete ({total:,} cases).")
+            conn.close()
+            return
+        lo = cur.execute("SELECT MIN(rowid) FROM cases").fetchone()[0] or 1
+        hi = cur.execute("SELECT MAX(rowid) FROM cases").fetchone()[0] or 0
+        # Resume from the highest indexed rowid (batches commit in rowid order)
+        try:
+            start = (cur.execute("SELECT MAX(rowid) FROM cases_names_fts_docsize").fetchone()[0] or 0) + 1
+        except sqlite3.OperationalError:
+            start = lo
+        if start < lo:
+            start = lo
+        BATCH = 50_000
+        done = max(indexed, 0)
+        print(f"[search] Indexing names/citations for {total:,} cases "
+              f"in batches of {BATCH:,}...", flush=True)
+        while start <= hi:
+            end = min(start + BATCH - 1, hi)
+            cur.execute(
+                "INSERT INTO cases_names_fts(rowid, id, name, citations) "
+                "SELECT rowid, id, name, citations FROM cases "
+                "WHERE rowid BETWEEN ? AND ?", (start, end))
+            done += cur.rowcount or 0
+            conn.commit()
+            rate = done / max(1e-9, time.time() - t0)
+            eta = (total - done) / rate / 60 if rate > 1 else 0
+            eta_s = f", ~{eta:.0f} min left" if eta >= 1 else ""
+            print(f"  [names-fts] {done:,}/{total:,} cases indexed "
+                  f"({rate:,.0f}/s{eta_s})", flush=True)
+            start = end + 1
+        conn.close()
+        print(f"[search] Name/citation index built in {(time.time()-t0)/60:.1f} min "
+              f"({total:,} cases).")
+    except Exception as e:
+        print(f"[search] Name/citation index error: {e} - re-run to resume.", flush=True)
 
 def ensure_indexes(db_path=DB_PATH):
     """Create the indexes CaseFind's fast search paths rely on, and give the

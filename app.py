@@ -46,10 +46,18 @@ def map_court_type(court_str):
     return "FD"
 
 def build_fts_query(words, column=None):
-    """Build an FTS5 MATCH expression; filter single-letter connectors and stopwords."""
+    """Build an FTS5 MATCH expression; filter single-letter connectors,
+    stopwords and duplicate words (each repeated term re-decodes its doclist)."""
     stop = {"v", "vs", "versus", "in", "re", "and", "the", "of", "et", "al"}
     meaningful = [w for w in words if w.lower() not in stop and len(w) > 1] or words
-    safe = [w.replace('"', " ").strip() for w in meaningful if w.strip()]
+    seen = set()
+    deduped = []
+    for w in meaningful:
+        lw = w.lower()
+        if lw not in seen:
+            seen.add(lw)
+            deduped.append(w)
+    safe = [w.replace('"', " ").strip() for w in deduped if w.strip()]
     if not safe:
         return None
     if column:
@@ -172,6 +180,7 @@ def python_snippet(text, words, max_words=24):
 
 _COURTS_CACHE = {"ts": 0.0, "data": None, "has_fb": None}
 _BROWSE_FILTERED = {}
+_NAMES_FTS = {"ok": False}
 _WARM = {"done": False}
 _WARM_LOCK = threading.Lock()
 
@@ -239,10 +248,27 @@ def _load_court_counts(conn, force=False):
     _COURTS_CACHE["ts"] = time.time()
     return data
 
+def _names_fts_ready(conn):
+    """True when the small (id, name, citations) FTS index exists and covers
+    every case. Called only from the startup/maintenance refresh - never
+    inline in requests - and cached in _NAMES_FTS."""
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cases_names_fts'"
+        ).fetchone():
+            return False
+        n_idx = conn.execute("SELECT COUNT(*) FROM cases_names_fts_docsize").fetchone()[0]
+        n_cases = _BROWSE_TOTAL["value"] or conn.execute(
+            "SELECT COUNT(*) FROM cases").fetchone()[0]
+        return n_cases > 0 and n_idx == n_cases
+    except Exception:
+        return False
+
 def _refresh_caches():
-    """One synchronous read-only cache refresh (court counts, browse total).
-    Runs at startup BEFORE the server listens, so the first user request
-    never pays the cold-scan cost (minutes on large databases)."""
+    """One synchronous read-only cache refresh (court counts, browse total,
+    name-index readiness). Runs at startup BEFORE the server listens, so the
+    first user request never pays the cold-scan cost (minutes on large
+    databases)."""
     if not os.path.exists(DB_PATH):
         return
     conn = get_db()
@@ -251,6 +277,7 @@ def _refresh_caches():
         _BROWSE_TOTAL["value"] = conn.execute(
             "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
         _BROWSE_TOTAL["ts"] = time.time()
+        _NAMES_FTS["ok"] = _names_fts_ready(conn)
     finally:
         conn.close()
 
@@ -480,14 +507,16 @@ def search():
         clean_q = re.sub(r'[^a-zA-Z0-9\s"]', ' ', q).strip()
         words = [w for w in clean_q.split() if w]
 
-        fts_name_q = build_fts_query(words, "name") if (has_fts and fts_has_name and words) else None
+        names_ready = _NAMES_FTS["ok"]
+        fts_name_q = build_fts_query(words, "name") if (((has_fts and fts_has_name) or names_ready) and words) else None
         fts_text_q = build_fts_query(words, "text") if (has_fts and fts_has_text and words) else None
         fts_any_q = build_fts_query(words, None) if (has_fts and words) else None
+        name_table = "cases_names_fts" if names_ready else "cases_fts"
 
         conds, c_params = row_filter_conds()
         conds_sql = (" AND " + " AND ".join(conds)) if conds else ""
 
-        def fts_pass(match_q):
+        def fts_pass(match_q, table="cases_fts"):
             """Return (match count, newest fetch_n rows).
 
             Without row filters the count is a pure FTS count with no probes
@@ -498,20 +527,20 @@ def search():
             if conds:
                 t = conn.execute(
                     f"SELECT COUNT(*) AS total FROM cases WHERE rowid IN "
-                    f"(SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?){conds_sql}",
+                    f"(SELECT rowid FROM {table} WHERE {table} MATCH ?){conds_sql}",
                     [match_q] + c_params).fetchone()["total"]
                 rows = conn.execute(
                     f"SELECT {select_sql} FROM cases WHERE rowid IN "
-                    f"(SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?){conds_sql}"
+                    f"(SELECT rowid FROM {table} WHERE {table} MATCH ?){conds_sql}"
                     f" ORDER BY {date_col} DESC LIMIT ?",
                     [match_q] + c_params + [fetch_n]).fetchall()
             else:
                 t = conn.execute(
-                    "SELECT COUNT(*) AS total FROM cases_fts WHERE cases_fts MATCH ?",
+                    f"SELECT COUNT(*) AS total FROM {table} WHERE {table} MATCH ?",
                     [match_q]).fetchone()["total"]
                 rows = conn.execute(
                     f"SELECT {select_sql} FROM cases {idx_hint} WHERE rowid IN "
-                    f"(SELECT rowid FROM cases_fts WHERE cases_fts MATCH ?)"
+                    f"(SELECT rowid FROM {table} WHERE {table} MATCH ?)"
                     f" ORDER BY {date_col} DESC LIMIT ?",
                     [match_q] + [fetch_n]).fetchall()
             return t, rows
@@ -523,7 +552,7 @@ def search():
         primary_q = None
         try:
             if scope == "title" and fts_name_q:
-                total, rows = fts_pass(fts_name_q)
+                total, rows = fts_pass(fts_name_q, name_table)
                 used_fts, primary_q = True, fts_name_q
                 passes.append((rows, 0))
             elif scope == "text" and fts_text_q:
@@ -535,7 +564,7 @@ def search():
                 used_fts, primary_q = True, fts_any_q
                 if fts_name_q:
                     # Title matches rank ahead of text-only matches
-                    _, name_rows = fts_pass(fts_name_q)
+                    _, name_rows = fts_pass(fts_name_q, name_table)
                     passes.append((name_rows, 0))
                     passes.append((rows, 1))
                 else:
@@ -551,10 +580,11 @@ def search():
         # one bounded scan over the small citations column.
         is_cite_q = any(ch.isdigit() for ch in q)
         if used_fts and cite_col and is_cite_q and scope in ("title", "both"):
-            if fts_has_cite:
+            cite_table = name_table if names_ready else ("cases_fts" if fts_has_cite else None)
+            if cite_table:
                 cite_q = build_fts_query(words, "citations")
                 if cite_q:
-                    ct, crows = fts_pass(cite_q)
+                    ct, crows = fts_pass(cite_q, cite_table)
                     total += ct
                     # Exact citation matches rank ahead of same-token matches
                     # (e.g. "384 U.S. 436" before "384 F.3d 436").
