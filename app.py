@@ -81,16 +81,17 @@ _BROWSE_TOTAL = {"ts": 0.0, "value": None}
 _warned_no_fts = False
 
 def db_has_bankruptcy(conn, ctype_col):
-    """True if bankruptcy (FB) rows exist; refreshed at most every 10 min.
+    """True if bankruptcy (FB) rows exist; long TTL (read-only app - the
+    value cannot change while the process runs).
 
     Prefers the court-type distribution that _load_court_counts already
-    computes (the maintenance thread and /api/courts keep it fresh), so the
-    usual path costs nothing. The fallback probe is a single index seek -
-    never the expression-wrapped scan, which reads the whole covering index
-    and is seconds-to-minutes cold on multi-million-case databases."""
+    computes (warmed at startup and by the maintenance thread), so the usual
+    path costs nothing. The fallback probe is a single index seek - never
+    the expression-wrapped scan, which reads the whole covering index and
+    is seconds-to-minutes cold on multi-million-case databases."""
     now = time.time()
-    if now - _FB_CHECK["checked_at"] > 600:
-        if _COURTS_CACHE.get("has_fb") is not None and now - _COURTS_CACHE["ts"] < 600:
+    if now - _FB_CHECK["checked_at"] > 21600:
+        if _COURTS_CACHE.get("has_fb") is not None and now - _COURTS_CACHE["ts"] < 21600:
             _FB_CHECK["has"] = _COURTS_CACHE["has_fb"]
         else:
             try:
@@ -175,8 +176,10 @@ _WARM = {"done": False}
 _WARM_LOCK = threading.Lock()
 
 def _load_court_counts(conn, force=False):
-    """Per-court-type counts via index-friendly queries; cached 10 minutes."""
-    if not force and _COURTS_CACHE["data"] is not None and time.time() - _COURTS_CACHE["ts"] < 600:
+    """Per-court-type counts via index-friendly queries. Long TTL: the app is
+    read-only, so these values cannot change while it runs - they only change
+    across restarts (which re-warm them)."""
+    if not force and _COURTS_CACHE["data"] is not None and time.time() - _COURTS_CACHE["ts"] < 21600:
         return _COURTS_CACHE["data"]
     court_defs = [
         {"value": "SCOTUS", "label": "Supreme Court"},
@@ -236,31 +239,49 @@ def _load_court_counts(conn, force=False):
     _COURTS_CACHE["ts"] = time.time()
     return data
 
-def _run_warmup():
-    """Recurring background maintenance: keeps the court counts, browse total
-    and bankruptcy flag caches fresh so no user request ever recomputes them.
+def _refresh_caches():
+    """One synchronous read-only cache refresh (court counts, browse total).
+    Runs at startup BEFORE the server listens, so the first user request
+    never pays the cold-scan cost (minutes on large databases)."""
+    if not os.path.exists(DB_PATH):
+        return
+    conn = get_db()
+    try:
+        _load_court_counts(conn, force=True)
+        _BROWSE_TOTAL["value"] = conn.execute(
+            "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
+        _BROWSE_TOTAL["ts"] = time.time()
+    finally:
+        conn.close()
 
-    Strictly read-only. The app NEVER writes to the database: index builds
-    and ANALYZE are long write transactions, and on network filesystems
-    (Lightning's teamspace) a long writer wedges every concurrent reader.
-    Indexes belong to: python ingest_cases.py --ensure-indexes (app stopped)."""
+def _run_warmup():
+    """Recurring background maintenance (read-only): keeps the court counts,
+    browse total and bankruptcy flag caches fresh so no user request ever
+    recomputes them. The first pass is normally already warm from the
+    blocking startup refresh in __main__.
+
+    The app NEVER writes to the database: index builds and ANALYZE are long
+    write transactions, and on network filesystems (Lightning's teamspace)
+    a long writer wedges every concurrent reader. Indexes belong to:
+    python ingest_cases.py --ensure-indexes (run with the app stopped)."""
     runs = 0
     while True:
         try:
             conn = get_db()
             try:
-                _load_court_counts(conn, force=True)
-                _BROWSE_TOTAL["value"] = conn.execute(
-                    "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
-                _BROWSE_TOTAL["ts"] = time.time()
+                _load_court_counts(conn, force=(runs > 0))
+                if _BROWSE_TOTAL["value"] is None or time.time() - _BROWSE_TOTAL["ts"] >= 3600:
+                    _BROWSE_TOTAL["value"] = conn.execute(
+                        "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
+                    _BROWSE_TOTAL["ts"] = time.time()
             finally:
                 conn.close()
             if runs == 0:
-                print("[warmup] caches warm; background refresh continues every 5 min", flush=True)
+                print("[warmup] background cache refresh running (every 30 min)", flush=True)
         except Exception as e:
             print(f"[warmup] refresh skipped: {e}", flush=True)
         runs += 1
-        time.sleep(300)
+        time.sleep(1800)
 
 def maybe_start_warmup():
     with _WARM_LOCK:
@@ -429,11 +450,11 @@ def search():
             where_sql = ("WHERE " + " AND ".join(conds)) if conds else ""
             now = time.time()
             total = None
-            if not conds and _BROWSE_TOTAL["value"] is not None and now - _BROWSE_TOTAL["ts"] < 600:
+            if not conds and _BROWSE_TOTAL["value"] is not None and now - _BROWSE_TOTAL["ts"] < 3600:
                 total = _BROWSE_TOTAL["value"]
             elif conds:
                 cached = _BROWSE_FILTERED.get((court_type, year_from, year_to))
-                if cached and now - cached["ts"] < 600:
+                if cached and now - cached["ts"] < 3600:
                     total = cached["total"]
             if total is None:
                 total = conn.execute(f"SELECT COUNT(*) AS total FROM cases {where_sql}", c_params).fetchone()["total"]
@@ -711,6 +732,15 @@ def start_ngrok(port=8001):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8001))
+    print("[startup] Warming search caches (one-time per restart; can take a "
+          "few minutes on large databases)...", flush=True)
+    try:
+        _refresh_caches()
+        print("[startup] Caches warm.", flush=True)
+    except Exception as e:
+        print(f"[startup] Cache warmup skipped: {e} - continuing; the "
+              "background refresh will retry.", flush=True)
+    maybe_start_warmup()
     start_ngrok(port)
     print(f"Local server listening on http://0.0.0.0:{port} (DB: {DB_PATH})")
     app.run(host="0.0.0.0", port=port)
