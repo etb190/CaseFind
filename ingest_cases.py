@@ -485,6 +485,90 @@ def build_names_fts(db_path=DB_PATH):
     except Exception as e:
         print(f"[search] Name/citation index error: {e} - re-run to resume.", flush=True)
 
+def purge_short_cases(db_path=DB_PATH, min_words=300, dry_run=False):
+    """Delete cases whose opinion text has fewer than min_words words.
+
+    Text is whitespace-normalized at ingest (single spaces), so
+    words = spaces + 1 exactly. Batched with per-batch commits (bounded
+    WAL) and progress output. FTS entries are removed surgically in the
+    same transaction: cases_fts and cases_names_fts are external-content
+    tables, so deleting rows from 'cases' alone would leave stale,
+    unmatched postings behind. Run with the app stopped. Re-runs are
+    safe (idempotent)."""
+    tag = "[dry run] " if dry_run else ""
+    print(f"\n[purge] {tag}Cases with fewer than {min_words} words in {db_path}...")
+    t0 = time.time()
+    conn = sqlite3.connect(db_path, timeout=300)
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA busy_timeout=300000")
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.execute("PRAGMA wal_autocheckpoint=1000")
+
+    has_main_fts = bool(cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cases_fts'").fetchone())
+    has_names_fts = bool(cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cases_names_fts'").fetchone())
+
+    # words = spaces + 1 (ingest collapses all whitespace to single spaces);
+    # NULL/empty text counts as 0 words.
+    WORDS = "COALESCE(LENGTH(text) - LENGTH(REPLACE(text, ' ', '')) + 1, 0)"
+
+    if dry_run:
+        rows = cur.execute(
+            f"SELECT COALESCE(court_type, '(none)') as ct, COUNT(*) as n FROM cases "
+            f"WHERE {WORDS} < ? GROUP BY ct ORDER BY n DESC", (min_words,)).fetchall()
+        total = sum(r[1] for r in rows)
+        print(f"[purge] Would delete {total:,} cases:")
+        for ct, n in rows:
+            print(f"    {ct}: {n:,}")
+        print(f"[purge] Dry run complete in {time.time()-t0:.0f}s. Nothing was deleted.")
+        conn.close()
+        return
+
+    total = cur.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+    lo = cur.execute("SELECT MIN(rowid) FROM cases").fetchone()[0] or 1
+    hi = cur.execute("SELECT MAX(rowid) FROM cases").fetchone()[0] or 0
+    BATCH = 25_000
+    start, deleted = lo, 0
+    print(f"[purge] Scanning {total:,} cases in batches of {BATCH:,}...", flush=True)
+    while start <= hi:
+        end = min(start + BATCH - 1, hi)
+        victims = cur.execute(
+            f"SELECT rowid, id, name, court, text, citations FROM cases "
+            f"WHERE rowid BETWEEN ? AND ? AND {WORDS} < ?",
+            (start, end, min_words)).fetchall()
+        if victims:
+            if has_main_fts:
+                cur.executemany(
+                    "INSERT INTO cases_fts(cases_fts, rowid, id, name, court, text, citations) "
+                    "VALUES('delete', ?, ?, ?, ?, ?, ?)",
+                    [(v[0], v[1], v[2], v[3], v[4], v[5]) for v in victims])
+            if has_names_fts:
+                cur.executemany(
+                    "INSERT INTO cases_names_fts(cases_names_fts, rowid, id, name, citations) "
+                    "VALUES('delete', ?, ?, ?, ?)",
+                    [(v[0], v[1], v[2], v[5]) for v in victims])
+            cur.executemany("DELETE FROM cases WHERE rowid = ?", [(v[0],) for v in victims])
+            deleted += len(victims)
+            conn.commit()
+        rate = (end - lo + 1) / max(1e-9, time.time() - t0)
+        eta = (hi - end) / rate / 60 if rate > 1 else 0
+        eta_s = f", ~{eta:.0f} min left" if eta >= 1 else ""
+        print(f"  [purge] scanned through rowid {end:,} | deleted {deleted:,} "
+              f"({rate:,.0f} rows/s{eta_s})", flush=True)
+        start = end + 1
+
+    remaining = cur.execute("SELECT COUNT(*) FROM cases").fetchone()[0]
+    try:
+        cur.execute("ANALYZE cases")
+        conn.commit()
+    except Exception:
+        pass
+    conn.close()
+    print(f"[purge] Deleted {deleted:,} cases; {remaining:,} remain "
+          f"({(time.time()-t0)/60:.1f} min). Start the app to refresh its counts.")
+
 def ensure_indexes(db_path=DB_PATH):
     """Create the indexes CaseFind's fast search paths rely on, and give the
     query planner stats. Run with the app stopped: these are long write
@@ -565,7 +649,14 @@ if __name__ == "__main__":
     parser.add_argument("--fix-court-types", action="store_true", help="Repair district court_type flags in existing database")
     parser.add_argument("--build-fts", action="store_true", help="Build or rebuild FTS5 full-text search table on current database")
     parser.add_argument("--ensure-indexes", action="store_true", help="Create/verify search indexes + planner stats (run with the app stopped)")
+    parser.add_argument("--purge-short", type=int, default=None, metavar="MIN_WORDS",
+                        help="Delete cases whose opinion text has fewer than MIN_WORDS words, all courts (run with the app stopped)")
+    parser.add_argument("--dry-run", action="store_true", help="With --purge-short: report what would be deleted, without deleting")
     args = parser.parse_args()
+
+    if args.purge_short is not None:
+        purge_short_cases(DB_PATH, min_words=args.purge_short, dry_run=args.dry_run)
+        sys.exit(0)
 
     if args.ensure_indexes:
         ensure_indexes(DB_PATH)
