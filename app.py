@@ -24,7 +24,10 @@ def get_db():
         conn.execute("PRAGMA busy_timeout=60000")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA cache_size=-131072")
-        conn.execute("PRAGMA mmap_size=1073741824")
+        # mmap disabled: on network filesystems (e.g. Lightning's teamspace)
+        # file-backed mmap page faults can stall or hang the requesting
+        # thread. Plain buffered reads are reliable there.
+        conn.execute("PRAGMA mmap_size=0")
     except Exception:
         pass
     conn.row_factory = sqlite3.Row
@@ -235,8 +238,12 @@ def _load_court_counts(conn, force=False):
 
 def _run_warmup():
     """Recurring background maintenance: keeps the court counts, browse total
-    and bankruptcy flag caches fresh every 5 minutes so no user request ever
-    recomputes them, and ensures the fast-path indexes exist."""
+    and bankruptcy flag caches fresh so no user request ever recomputes them.
+
+    Strictly read-only. The app NEVER writes to the database: index builds
+    and ANALYZE are long write transactions, and on network filesystems
+    (Lightning's teamspace) a long writer wedges every concurrent reader.
+    Indexes belong to: python ingest_cases.py --ensure-indexes (app stopped)."""
     runs = 0
     while True:
         try:
@@ -246,35 +253,10 @@ def _run_warmup():
                 _BROWSE_TOTAL["value"] = conn.execute(
                     "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
                 _BROWSE_TOTAL["ts"] = time.time()
-                if os.environ.get("CASEFIND_SKIP_INDEX") != "1":
-                    try:
-                        # Ensure the indexes the fast paths rely on exist.
-                        # IF NOT EXISTS = no-op when present; built once in the
-                        # background so no user request ever waits on them.
-                        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_court_type ON cases(court_type)")
-                        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_court ON cases(court)")
-                        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_date ON cases(date_filed)")
-                        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_ctype_date ON cases(court_type, date_filed)")
-                        conn.commit()
-                    except Exception as e:
-                        print(f"[warmup] index creation skipped: {e}", flush=True)
-                try:
-                    # Table-scoped ANALYZE: gives the planner stats for the cases
-                    # indexes only (a full ANALYZE would grind the FTS b-trees
-                    # too). Skipped when stats already exist so restarts stay cheap.
-                    has_stats = conn.execute(
-                        "SELECT 1 FROM sqlite_stat1 WHERE tbl = 'cases' LIMIT 1"
-                    ).fetchone()
-                    if not has_stats:
-                        conn.execute("ANALYZE cases")
-                        conn.commit()
-                except Exception:
-                    pass
             finally:
                 conn.close()
             if runs == 0:
-                print("[warmup] caches warm (court counts, totals, indexes, stats); "
-                      "background refresh continues every 5 min", flush=True)
+                print("[warmup] caches warm; background refresh continues every 5 min", flush=True)
         except Exception as e:
             print(f"[warmup] refresh skipped: {e}", flush=True)
         runs += 1

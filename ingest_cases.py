@@ -326,6 +326,7 @@ def run_ingest(date_str=DEFAULT_DATE, target_count=None, clear=True, include_dis
 
     # 5. Build SQLite FTS5 Full-Text Search Table for fast searching
     build_fts(DB_PATH)
+    ensure_indexes(DB_PATH)
 
     conn.close()
 
@@ -415,6 +416,42 @@ def build_fts(db_path=DB_PATH):
         print("[search] The index may be incomplete - simply re-run this command; "
               "it starts a clean rebuild.", flush=True)
 
+def ensure_indexes(db_path=DB_PATH):
+    """Create the indexes CaseFind's fast search paths rely on, and give the
+    query planner stats. Run with the app stopped: these are long write
+    transactions on large databases (many minutes over network storage), and
+    the app itself is strictly read-only by design."""
+    print(f"\n[indexes] Ensuring search indexes on {db_path}...")
+    t0 = time.time()
+    conn = sqlite3.connect(db_path, timeout=300)
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA busy_timeout=300000")
+    for name, stmt in (
+        ("idx_cases_court_type", "CREATE INDEX IF NOT EXISTS idx_cases_court_type ON cases(court_type)"),
+        ("idx_cases_court", "CREATE INDEX IF NOT EXISTS idx_cases_court ON cases(court)"),
+        ("idx_cases_date", "CREATE INDEX IF NOT EXISTS idx_cases_date ON cases(date_filed)"),
+        ("idx_cases_ctype_date", "CREATE INDEX IF NOT EXISTS idx_cases_ctype_date ON cases(court_type, date_filed)"),
+    ):
+        try:
+            cur.execute(stmt)
+            conn.commit()
+            print(f"  [index] {name}: ok ({time.time()-t0:.0f}s)", flush=True)
+        except Exception as e:
+            print(f"  [index] {name}: skipped ({e})", flush=True)
+    try:
+        if cur.execute("SELECT 1 FROM sqlite_stat1 WHERE tbl = 'cases' LIMIT 1").fetchone():
+            print("  [stats] planner stats already present")
+        else:
+            print("  [stats] running ANALYZE cases...", flush=True)
+            cur.execute("ANALYZE cases")
+            conn.commit()
+            print(f"  [stats] done ({time.time()-t0:.0f}s)", flush=True)
+    except Exception as e:
+        print(f"  [stats] skipped ({e})", flush=True)
+    conn.close()
+    print(f"[indexes] done in {(time.time()-t0)/60:.1f} min.")
+
 def fix_court_types(db_path=DB_PATH):
     print(f"\n[maintenance] Repairing court_type values in {db_path}...")
     t0 = time.time()
@@ -458,7 +495,12 @@ if __name__ == "__main__":
     parser.add_argument("--court", type=str, default=None, help="Restrict ingestion to one court id (e.g. scotus, ca9, nyed)")
     parser.add_argument("--fix-court-types", action="store_true", help="Repair district court_type flags in existing database")
     parser.add_argument("--build-fts", action="store_true", help="Build or rebuild FTS5 full-text search table on current database")
+    parser.add_argument("--ensure-indexes", action="store_true", help="Create/verify search indexes + planner stats (run with the app stopped)")
     args = parser.parse_args()
+
+    if args.ensure_indexes:
+        ensure_indexes(DB_PATH)
+        sys.exit(0)
 
     if args.fix_court_types:
         fix_court_types(DB_PATH)
