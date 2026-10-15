@@ -101,6 +101,9 @@ export const SearchPage: React.FC = () => {
         setIsLoading(false);
       })
       .catch((err: any) => {
+        // Drop the previous result set so the header never shows a stale
+        // count (e.g. the browse total) alongside the error card.
+        setData(null);
         setError(err.message || "Couldn't reach the server. Try again.");
         setIsLoading(false);
       });

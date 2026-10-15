@@ -78,18 +78,26 @@ _BROWSE_TOTAL = {"ts": 0.0, "value": None}
 _warned_no_fts = False
 
 def db_has_bankruptcy(conn, ctype_col):
-    """True if bankruptcy (FB) rows exist. Checked at most every 10 minutes:
-    the check is a metadata-only scan (opinion text lives in overflow pages
-    and is never read)."""
-    if time.time() - _FB_CHECK["checked_at"] > 600:
-        try:
-            row = conn.execute(
-                f"SELECT 1 FROM cases WHERE UPPER(COALESCE({ctype_col}, '')) = 'FB' LIMIT 1"
-            ).fetchone()
-            _FB_CHECK["has"] = row is not None
-        except Exception:
-            _FB_CHECK["has"] = True
-        _FB_CHECK["checked_at"] = time.time()
+    """True if bankruptcy (FB) rows exist; refreshed at most every 10 min.
+
+    Prefers the court-type distribution that _load_court_counts already
+    computes (the maintenance thread and /api/courts keep it fresh), so the
+    usual path costs nothing. The fallback probe is a single index seek -
+    never the expression-wrapped scan, which reads the whole covering index
+    and is seconds-to-minutes cold on multi-million-case databases."""
+    now = time.time()
+    if now - _FB_CHECK["checked_at"] > 600:
+        if _COURTS_CACHE.get("has_fb") is not None and now - _COURTS_CACHE["ts"] < 600:
+            _FB_CHECK["has"] = _COURTS_CACHE["has_fb"]
+        else:
+            try:
+                row = conn.execute(
+                    f"SELECT 1 FROM cases WHERE {ctype_col} = 'FB' LIMIT 1"
+                ).fetchone()
+                _FB_CHECK["has"] = row is not None
+            except Exception:
+                _FB_CHECK["has"] = True
+        _FB_CHECK["checked_at"] = now
     return _FB_CHECK["has"]
 
 # ---------------- API ENDPOINTS ----------------
@@ -158,14 +166,14 @@ def python_snippet(text, words, max_words=24):
         s += " …"
     return s
 
-_COURTS_CACHE = {"ts": 0.0, "data": None}
+_COURTS_CACHE = {"ts": 0.0, "data": None, "has_fb": None}
 _BROWSE_FILTERED = {}
 _WARM = {"done": False}
 _WARM_LOCK = threading.Lock()
 
-def _load_court_counts(conn):
+def _load_court_counts(conn, force=False):
     """Per-court-type counts via index-friendly queries; cached 10 minutes."""
-    if _COURTS_CACHE["data"] is not None and time.time() - _COURTS_CACHE["ts"] < 600:
+    if not force and _COURTS_CACHE["data"] is not None and time.time() - _COURTS_CACHE["ts"] < 600:
         return _COURTS_CACHE["data"]
     court_defs = [
         {"value": "SCOTUS", "label": "Supreme Court"},
@@ -177,6 +185,7 @@ def _load_court_counts(conn):
     court_col = "court" if "court" in cols else "court_id"
 
     court_counts = {"SCOTUS": 0, "F": 0, "FD": 0, "FS": 0}
+    has_fb = False
     if "court_type" in cols:
         # ingest stores canonical uppercase court_type / lowercase court ids,
         # so plain GROUP BY rides the covering idx_cases_court_type.
@@ -184,6 +193,7 @@ def _load_court_counts(conn):
             "SELECT court_type as ctype, COUNT(*) as cnt FROM cases GROUP BY court_type"
         ).fetchall()
         base = {(r["ctype"] or "").upper(): r["cnt"] for r in rows}
+        has_fb = base.get("FB", 0) > 0
         scotus_legacy = 0
         if base.get("F"):
             # Legacy DBs stored SCOTUS under court_type 'F'
@@ -212,54 +222,63 @@ def _load_court_counts(conn):
         rows = conn.execute(f"SELECT {court_col} as court, COUNT(*) as cnt FROM cases GROUP BY {court_col}").fetchall()
         for r in rows:
             t = map_court_type(r["court"])
-            if t in court_counts:
+            if t == "FB":
+                has_fb = True
+            elif t in court_counts:
                 court_counts[t] += r["cnt"]
 
     data = [{**d, "count": court_counts[d["value"]]} for d in court_defs]
     _COURTS_CACHE["data"] = data
+    _COURTS_CACHE["has_fb"] = has_fb
     _COURTS_CACHE["ts"] = time.time()
     return data
 
 def _run_warmup():
-    try:
-        conn = get_db()
+    """Recurring background maintenance: keeps the court counts, browse total
+    and bankruptcy flag caches fresh every 5 minutes so no user request ever
+    recomputes them, and ensures the fast-path indexes exist."""
+    runs = 0
+    while True:
         try:
-            _load_court_counts(conn)
-            _BROWSE_TOTAL["value"] = conn.execute(
-                "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
-            _BROWSE_TOTAL["ts"] = time.time()
-            cols = [col[1] for col in conn.execute("PRAGMA table_info(cases)").fetchall()]
-            if "court_type" in cols:
-                db_has_bankruptcy(conn, "court_type")
-            if os.environ.get("CASEFIND_SKIP_INDEX") != "1":
-                try:
-                    # Ensure the indexes the fast paths rely on exist.
-                    # IF NOT EXISTS = no-op when present; built once in the
-                    # background so no user request ever waits on them.
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_court_type ON cases(court_type)")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_court ON cases(court)")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_date ON cases(date_filed)")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_ctype_date ON cases(court_type, date_filed)")
-                    conn.commit()
-                except Exception as e:
-                    print(f"[warmup] index creation skipped: {e}", flush=True)
+            conn = get_db()
             try:
-                # Table-scoped ANALYZE: gives the planner stats for the cases
-                # indexes only (a full ANALYZE would grind the FTS b-trees
-                # too). Skipped when stats already exist so restarts stay cheap.
-                has_stats = conn.execute(
-                    "SELECT 1 FROM sqlite_stat1 WHERE tbl = 'cases' LIMIT 1"
-                ).fetchone()
-                if not has_stats:
-                    conn.execute("ANALYZE cases")
-                    conn.commit()
-            except Exception:
-                pass
-        finally:
-            conn.close()
-        print("[warmup] caches warm (court counts, totals, indexes, stats)", flush=True)
-    except Exception as e:
-        print(f"[warmup] skipped: {e}", flush=True)
+                _load_court_counts(conn, force=True)
+                _BROWSE_TOTAL["value"] = conn.execute(
+                    "SELECT COUNT(*) AS total FROM cases").fetchone()["total"]
+                _BROWSE_TOTAL["ts"] = time.time()
+                if os.environ.get("CASEFIND_SKIP_INDEX") != "1":
+                    try:
+                        # Ensure the indexes the fast paths rely on exist.
+                        # IF NOT EXISTS = no-op when present; built once in the
+                        # background so no user request ever waits on them.
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_court_type ON cases(court_type)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_court ON cases(court)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_date ON cases(date_filed)")
+                        conn.execute("CREATE INDEX IF NOT EXISTS idx_cases_ctype_date ON cases(court_type, date_filed)")
+                        conn.commit()
+                    except Exception as e:
+                        print(f"[warmup] index creation skipped: {e}", flush=True)
+                try:
+                    # Table-scoped ANALYZE: gives the planner stats for the cases
+                    # indexes only (a full ANALYZE would grind the FTS b-trees
+                    # too). Skipped when stats already exist so restarts stay cheap.
+                    has_stats = conn.execute(
+                        "SELECT 1 FROM sqlite_stat1 WHERE tbl = 'cases' LIMIT 1"
+                    ).fetchone()
+                    if not has_stats:
+                        conn.execute("ANALYZE cases")
+                        conn.commit()
+                except Exception:
+                    pass
+            finally:
+                conn.close()
+            if runs == 0:
+                print("[warmup] caches warm (court counts, totals, indexes, stats); "
+                      "background refresh continues every 5 min", flush=True)
+        except Exception as e:
+            print(f"[warmup] refresh skipped: {e}", flush=True)
+        runs += 1
+        time.sleep(300)
 
 def maybe_start_warmup():
     with _WARM_LOCK:
